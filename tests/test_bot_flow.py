@@ -13,14 +13,20 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.bot import (
+    AIRPLANE_IDS,
+    ArcadeSetup,
     CaseSetup,
     CasinoSetup,
     ContestBot,
+    FootballSetup,
+    FOOTBALLERS,
     GuessSetup,
     InterceptSetup,
+    football_pick_keyboard,
     game_key,
 )
 from app.config import Settings
+from app.engine import ContestState, ContestType, Participant
 from app.storage import BotStorage
 
 
@@ -312,6 +318,139 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("0.04%", text)
         self.assertIn("0.03%", text)
         self.assertNotIn("0.1%", text)
+
+    async def test_airplane_setup_uses_standard_form_and_starts_game(self) -> None:
+        self._prepare_targets()
+        await self.state.set_state(ArcadeSetup.screenshot)
+        await self.state.set_data(
+            {
+                "arcade_kind": ContestType.AIRPLANE.value,
+                "prize": "NFT prize",
+                "stars": 10,
+                "duration": 60,
+            }
+        )
+
+        message = FakeMessage()
+        await self.contest_bot._finish_arcade_setup(message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNotNone(active)
+        self.assertEqual(active.kind, ContestType.AIRPLANE)
+        self.assertEqual(active.message_stars, 10)
+        self.assertEqual(active.tracking_after_message_id, 1)
+
+    async def test_football_setup_starts_automatic_prediction_round(self) -> None:
+        self._prepare_targets()
+        await self.state.set_state(FootballSetup.screenshot)
+        await self.state.set_data(
+            {
+                "team_a": "Blue Stars",
+                "team_b": "Red Stars",
+                "stars": 20,
+                "duration": 60,
+            }
+        )
+
+        message = FakeMessage()
+        await self.contest_bot._finish_football_setup(message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNotNone(active)
+        self.assertEqual(active.kind, ContestType.FOOTBALL)
+        self.assertEqual(active.team_a_name, "Blue Stars")
+        self.assertEqual(active.team_b_name, "Red Stars")
+        self.assertEqual(active.message_stars, 20)
+        sent_markup = self.bot.send_message.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in sent_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("football:pick:draw", callbacks)
+        self.assertEqual(
+            len([value for value in callbacks if value.startswith("football:player:")]),
+            10,
+        )
+
+    def test_football_keyboard_has_both_teams_draw_and_ten_players(self) -> None:
+        keyboard = football_pick_keyboard("Blue", "Red")
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            callbacks[:3],
+            ["football:pick:a", "football:pick:draw", "football:pick:b"],
+        )
+        self.assertEqual(len(callbacks), 13)
+
+    def test_airplane_animation_uses_premium_plane_and_twenty_percent_birds(self) -> None:
+        alice = Participant(1, "Alice", "alice")
+        bob = Participant(2, "Bob", "bob")
+        self.contest_bot._random = SimpleNamespace(
+            random=lambda: 0.10,
+            randint=lambda start, end: 1,
+            choice=lambda values: values[0],
+        )
+
+        frames = self.contest_bot._airplane_frames([alice, bob], alice)
+
+        self.assertEqual(len(frames), 11)
+        self.assertIn(AIRPLANE_IDS[0], frames[-1])
+        self.assertIn(AIRPLANE_IDS[1], frames[1])
+        self.assertIn("Первый самолёт", frames[-1])
+
+    def test_football_post_contains_all_premium_players(self) -> None:
+        text = self.contest_bot._football_start_text("Blue", "Red", 20, 60)
+        for _, emoji_id, _ in FOOTBALLERS:
+            self.assertIn(emoji_id, text)
+        self.assertIn("1,5×", text)
+        self.assertIn("10 атак", text)
+
+    async def test_football_win_announces_one_and_a_half_times_payout(self) -> None:
+        participant = Participant(100, "Player", "player")
+        state = ContestState(
+            game_id=1,
+            kind=ContestType.FOOTBALL,
+            started_at=0,
+            message_stars=20,
+            team_a_name="Blue",
+            team_b_name="Red",
+            participants={participant.user_id: participant},
+            football_picks={participant.user_id: "a"},
+            football_players={participant.user_id: 0},
+        )
+        self.contest_bot._safe_public = AsyncMock()
+
+        await self.contest_bot._announce_football_result(
+            game_key(-1001), state, [2, 1]
+        )
+
+        text = self.contest_bot._safe_public.await_args.args[1]
+        self.assertIn("30 Stars", text)
+        self.assertIn("@player", text)
+        self.assertIn(FOOTBALLERS[0][1], text)
+
+    async def test_football_draw_burns_every_prediction(self) -> None:
+        state = ContestState(
+            game_id=1,
+            kind=ContestType.FOOTBALL,
+            started_at=0,
+            message_stars=21,
+            team_a_name="Blue",
+            team_b_name="Red",
+        )
+        self.contest_bot._safe_public = AsyncMock()
+
+        await self.contest_bot._announce_football_result(
+            game_key(-1001), state, [3, 3]
+        )
+
+        text = self.contest_bot._safe_public.await_args.args[1]
+        self.assertIn("сгорают", text)
+        self.assertNotIn("31,5 Stars", text)
 
 
 if __name__ == "__main__":

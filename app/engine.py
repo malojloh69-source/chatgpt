@@ -19,6 +19,11 @@ class ContestType(StrEnum):
     GUESS = "guess"
     RACE = "race"
     CASE = "case"
+    AIRPLANE = "airplane"
+    PARKOUR = "parkour"
+    SNAKE = "snake"
+    PICKAXE = "pickaxe"
+    FOOTBALL = "football"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +57,10 @@ class ContestState:
     participants: dict[int, Participant] = field(default_factory=dict)
     case_name: str = ""
     case_drops: tuple[DropOutcome, ...] = ()
+    team_a_name: str = ""
+    team_b_name: str = ""
+    football_picks: dict[int, str] = field(default_factory=dict)
+    football_players: dict[int, int] = field(default_factory=dict)
     processed_message_ids: set[int] = field(default_factory=set)
     generation: int = 0
 
@@ -95,12 +104,29 @@ class CasinoSpinUpdate:
 class RaceJoinUpdate:
     accepted: bool
     participant_count: int
+    collection_ready: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class CaseOpenUpdate:
     outcome: DropOutcome | None
     state: ContestState
+
+
+@dataclass(frozen=True, slots=True)
+class ParkourAttemptUpdate:
+    obstacle_kinds: tuple[str, ...]
+    collision_index: int | None
+    winner: Participant | None = None
+    finished_state: ContestState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FootballPickUpdate:
+    accepted: bool
+    choice: str
+    changed: bool
+    counts: dict[str, int]
 
 
 class ContestManager:
@@ -150,6 +176,8 @@ class ContestManager:
             spin_available_at=dict(state.spin_available_at),
             participants=dict(state.participants),
             case_drops=tuple(state.case_drops),
+            football_picks=dict(state.football_picks),
+            football_players=dict(state.football_players),
             processed_message_ids=set(state.processed_message_ids),
         )
 
@@ -295,6 +323,79 @@ class ContestManager:
             )
             return self._copy_state(state)
 
+    async def start_arcade(
+        self,
+        key: ContestKey,
+        kind: ContestType,
+        seconds: float,
+        *,
+        prize: str = "",
+        message_stars: int = 0,
+        tracking_after_message_id: int | None = None,
+    ) -> ContestState:
+        allowed = {
+            ContestType.AIRPLANE,
+            ContestType.PARKOUR,
+            ContestType.SNAKE,
+            ContestType.PICKAXE,
+        }
+        if kind not in allowed:
+            raise ValueError("unsupported arcade contest type")
+        if seconds <= 0:
+            raise ValueError("seconds must be positive")
+        if message_stars < 0:
+            raise ValueError("message_stars must not be negative")
+        async with self._lock:
+            self._cancel_timer_locked(key)
+            state = self._new_state(
+                kind,
+                prize=prize,
+                tracking_after_message_id=tracking_after_message_id,
+            )
+            state.message_stars = message_stars
+            state.deadline = self._clock() + seconds
+            self._states[key] = state
+            self._timers[key] = asyncio.create_task(
+                self._run_deadline_timer(key, state.game_id),
+                name=f"{kind.value}-{key[0]}-{state.game_id}",
+            )
+            return self._copy_state(state)
+
+    async def start_football(
+        self,
+        key: ContestKey,
+        team_a_name: str,
+        team_b_name: str,
+        seconds: float,
+        *,
+        message_stars: int = 0,
+        tracking_after_message_id: int | None = None,
+    ) -> ContestState:
+        team_a = team_a_name.strip()
+        team_b = team_b_name.strip()
+        if not team_a or not team_b or team_a.casefold() == team_b.casefold():
+            raise ValueError("team names must be non-empty and different")
+        if seconds <= 0:
+            raise ValueError("seconds must be positive")
+        if message_stars < 0:
+            raise ValueError("message_stars must not be negative")
+        async with self._lock:
+            self._cancel_timer_locked(key)
+            state = self._new_state(
+                ContestType.FOOTBALL,
+                tracking_after_message_id=tracking_after_message_id,
+            )
+            state.team_a_name = team_a
+            state.team_b_name = team_b
+            state.message_stars = message_stars
+            state.deadline = self._clock() + seconds
+            self._states[key] = state
+            self._timers[key] = asyncio.create_task(
+                self._run_deadline_timer(key, state.game_id),
+                name=f"football-{key[0]}-{state.game_id}",
+            )
+            return self._copy_state(state)
+
     async def stop(self, key: ContestKey) -> ContestState | None:
         async with self._lock:
             self._cancel_timer_locked(key)
@@ -392,6 +493,134 @@ class ContestManager:
             state.participants[participant.user_id] = participant
             return RaceJoinUpdate(True, len(state.participants))
 
+    async def submit_arcade_join(
+        self, key: ContestKey, participant: Participant
+    ) -> RaceJoinUpdate | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind not in {
+                ContestType.AIRPLANE,
+                ContestType.SNAKE,
+                ContestType.PICKAXE,
+            }:
+                return None
+            if participant.user_id in state.participants:
+                return RaceJoinUpdate(False, len(state.participants))
+            limit = {
+                ContestType.AIRPLANE: 30,
+                ContestType.SNAKE: 8,
+                ContestType.PICKAXE: 5,
+            }[state.kind]
+            if len(state.participants) >= limit:
+                return RaceJoinUpdate(False, len(state.participants), True)
+            state.participants[participant.user_id] = participant
+            count = len(state.participants)
+            ready = (
+                (state.kind is ContestType.SNAKE and count == 8)
+                or (state.kind is ContestType.PICKAXE and count == 5)
+            )
+            return RaceJoinUpdate(True, count, ready)
+
+    async def submit_parkour(
+        self,
+        key: ContestKey,
+        participant: Participant,
+        message_id: int,
+    ) -> ParkourAttemptUpdate | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind is not ContestType.PARKOUR:
+                return None
+            if message_id in state.processed_message_ids:
+                return None
+            state.processed_message_ids.add(message_id)
+            state.participants[participant.user_id] = participant
+
+            obstacle_kinds: list[str] = []
+            collision_index: int | None = None
+            kinds = ("wall", "trash", "animal")
+            for index in range(10):
+                obstacle = kinds[min(2, int(self._random_value() * len(kinds)))]
+                obstacle_kinds.append(obstacle)
+                if collision_index is None and self._random_value() < 0.25:
+                    collision_index = index
+
+            if collision_index is not None:
+                return ParkourAttemptUpdate(tuple(obstacle_kinds), collision_index)
+
+            finished_state = self._copy_state(state)
+            self._states.pop(key, None)
+            self._cancel_timer_locked(key)
+            return ParkourAttemptUpdate(
+                tuple(obstacle_kinds),
+                None,
+                winner=participant,
+                finished_state=finished_state,
+            )
+
+    async def submit_football_pick(
+        self,
+        key: ContestKey,
+        participant: Participant,
+        choice: str,
+    ) -> FootballPickUpdate | None:
+        if choice not in {"a", "draw", "b"}:
+            return None
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind is not ContestType.FOOTBALL:
+                return None
+            if (
+                state.tracking_after_message_id is None
+                or state.deadline is None
+                or state.deadline <= self._clock()
+            ):
+                return None
+            previous = state.football_picks.get(participant.user_id)
+            state.participants[participant.user_id] = participant
+            state.football_picks[participant.user_id] = choice
+            counts = {
+                option: sum(value == option for value in state.football_picks.values())
+                for option in ("a", "draw", "b")
+            }
+            return FootballPickUpdate(True, choice, previous not in {None, choice}, counts)
+
+    async def submit_football_player(
+        self,
+        key: ContestKey,
+        participant: Participant,
+        player_index: int,
+    ) -> bool:
+        if not 0 <= player_index < 10:
+            return False
+        async with self._lock:
+            state = self._states.get(key)
+            if (
+                state is None
+                or state.kind is not ContestType.FOOTBALL
+                or state.deadline is None
+                or state.deadline <= self._clock()
+            ):
+                return False
+            state.participants[participant.user_id] = participant
+            state.football_players[participant.user_id] = player_index
+            return True
+
+    async def finish_collection_now(self, key: ContestKey) -> ContestState | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind not in {
+                ContestType.SNAKE,
+                ContestType.PICKAXE,
+            }:
+                return None
+            required = 8 if state.kind is ContestType.SNAKE else 5
+            if len(state.participants) < required:
+                return None
+            self._states.pop(key, None)
+            self._cancel_timer_locked(key)
+            return self._copy_state(state)
+
     async def open_case(
         self, key: ContestKey, message_id: int
     ) -> CaseOpenUpdate | None:
@@ -420,7 +649,16 @@ class ContestManager:
                     if (
                         state is None
                         or state.game_id != game_id
-                        or state.kind not in {ContestType.RACE, ContestType.CASE}
+                        or state.kind
+                        not in {
+                            ContestType.RACE,
+                            ContestType.CASE,
+                            ContestType.AIRPLANE,
+                            ContestType.PARKOUR,
+                            ContestType.SNAKE,
+                            ContestType.PICKAXE,
+                            ContestType.FOOTBALL,
+                        }
                         or state.deadline is None
                     ):
                         return

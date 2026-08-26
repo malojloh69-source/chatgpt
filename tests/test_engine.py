@@ -172,6 +172,98 @@ class ContestManagerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.close()
 
+    async def test_snake_accepts_at_most_eight_and_can_start_immediately(self) -> None:
+        await self.manager.start_arcade(
+            self.key, ContestType.SNAKE, 60, prize="Prize"
+        )
+        last_update = None
+        for user_id in range(1, 9):
+            last_update = await self.manager.submit_arcade_join(
+                self.key, Participant(user_id, f"Player {user_id}")
+            )
+        self.assertIsNotNone(last_update)
+        self.assertTrue(last_update.collection_ready)
+        self.assertEqual(last_update.participant_count, 8)
+
+        finished = await self.manager.finish_collection_now(self.key)
+        self.assertIsNotNone(finished)
+        self.assertEqual(len(finished.participants), 8)
+        self.assertIsNone(await self.manager.snapshot(self.key))
+
+    async def test_pickaxe_becomes_ready_on_fifth_unique_participant(self) -> None:
+        await self.manager.start_arcade(self.key, ContestType.PICKAXE, 60)
+        updates = []
+        for user_id in range(1, 6):
+            updates.append(
+                await self.manager.submit_arcade_join(
+                    self.key, Participant(user_id, f"Player {user_id}")
+                )
+            )
+        self.assertFalse(updates[3].collection_ready)
+        self.assertTrue(updates[4].collection_ready)
+
+    async def test_parkour_uses_ten_obstacles_and_exact_collision_threshold(self) -> None:
+        values = iter([0.0, 0.249] + [0.0] * 9)
+
+        async def ignore_winner(key, participant, state):
+            return None
+
+        manager = ContestManager(ignore_winner, random_value=lambda: next(values))
+        try:
+            await manager.start_arcade(self.key, ContestType.PARKOUR, 60)
+            result = await manager.submit_parkour(self.key, self.alice, 101)
+            self.assertIsNotNone(result)
+            self.assertEqual(len(result.obstacle_kinds), 10)
+            self.assertEqual(result.collision_index, 0)
+            self.assertIsNone(result.winner)
+            self.assertIsNotNone(await manager.snapshot(self.key))
+        finally:
+            await manager.close()
+
+    async def test_parkour_first_full_run_wins_and_closes_game(self) -> None:
+        values = iter([value for _ in range(10) for value in (0.0, 0.25)])
+
+        async def ignore_winner(key, participant, state):
+            return None
+
+        manager = ContestManager(ignore_winner, random_value=lambda: next(values))
+        try:
+            await manager.start_arcade(self.key, ContestType.PARKOUR, 60)
+            result = await manager.submit_parkour(self.key, self.alice, 102)
+            self.assertIsNotNone(result)
+            self.assertIsNone(result.collision_index)
+            self.assertEqual(result.winner, self.alice)
+            self.assertIsNotNone(result.finished_state)
+            self.assertIsNone(await manager.snapshot(self.key))
+        finally:
+            await manager.close()
+
+    async def test_football_prediction_can_be_changed_before_deadline(self) -> None:
+        await self.manager.start_football(
+            self.key,
+            "Blue",
+            "Red",
+            60,
+            message_stars=10,
+            tracking_after_message_id=500,
+        )
+        first = await self.manager.submit_football_pick(self.key, self.alice, "a")
+        changed = await self.manager.submit_football_pick(
+            self.key, self.alice, "b"
+        )
+        player_selected = await self.manager.submit_football_player(
+            self.key, self.alice, 7
+        )
+        self.assertIsNotNone(first)
+        self.assertFalse(first.changed)
+        self.assertIsNotNone(changed)
+        self.assertTrue(changed.changed)
+        self.assertTrue(player_selected)
+        self.assertEqual(changed.counts, {"a": 0, "draw": 0, "b": 1})
+        state = await self.manager.snapshot(self.key)
+        self.assertEqual(state.football_picks[self.alice.user_id], "b")
+        self.assertEqual(state.football_players[self.alice.user_id], 7)
+
 
 if __name__ == "__main__":
     unittest.main()
