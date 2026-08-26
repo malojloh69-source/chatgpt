@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import re
+import secrets
 import sys
 from pathlib import Path
 
@@ -31,10 +32,11 @@ from .engine import (
     ContestManager,
     ContestState,
     ContestType,
+    DropOutcome,
     Participant,
     SpinStatus,
 )
-from .storage import BotStorage, KnownChat
+from .storage import BotStorage, KnownChat, SavedCase, SavedDrop
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,20 @@ INTERCEPT_UPDATE_IDS = (
     "5431870019996767493",
     "6032693626394382504",
 )
+ACTIVITY_IDS = (
+    "5348125643852758491",
+    "5280598054901145762",
+    "5283228279988309088",
+    "5280947338821524402",
+    "5280922999241859582",
+    "5350596259365273418",
+)
+ACTIVITY_DROPS = (
+    DropOutcome("🧸", 0.05),
+    DropOutcome("💝", 0.05),
+    DropOutcome("🌹", 0.04),
+    DropOutcome("💎", 0.03),
+)
 
 
 class CasinoSetup(StatesGroup):
@@ -85,6 +101,30 @@ class InterceptSetup(StatesGroup):
     prize = State()
     duration = State()
     stars = State()
+    screenshot = State()
+
+
+class GuessSetup(StatesGroup):
+    prize = State()
+    screenshot = State()
+    secret_number = State()
+    stars = State()
+
+
+class RaceSetup(StatesGroup):
+    prize = State()
+    stars = State()
+    duration = State()
+    screenshot = State()
+
+
+class CaseSetup(StatesGroup):
+    drop_name = State()
+    drop_chance = State()
+    drops_ready = State()
+    name = State()
+    stars = State()
+    duration = State()
     screenshot = State()
 
 
@@ -139,6 +179,44 @@ def parse_duration(raw: str) -> int | None:
     return seconds if 10 <= seconds <= 86400 else None
 
 
+def parse_stars(raw: str) -> int | None:
+    value = raw.replace(" ", "").strip()
+    if not value.isdigit():
+        return None
+    stars = int(value)
+    return stars if 0 <= stars <= 1_000_000 else None
+
+
+def parse_chance(raw: str) -> float | None:
+    value = raw.strip().replace(",", ".").removesuffix("%").strip()
+    try:
+        chance = float(value)
+    except ValueError:
+        return None
+    return chance if math.isfinite(chance) and 0 <= chance <= 100 else None
+
+
+def format_chance(chance: float) -> str:
+    return f"{chance:.6f}".rstrip("0").rstrip(".")
+
+
+def paid_message_is_valid(message: Message, required_stars: int) -> bool:
+    if required_stars <= 0:
+        return True
+    return int(getattr(message, "paid_star_count", 0) or 0) >= required_stars
+
+
+def select_drop(
+    drops: tuple[DropOutcome, ...], roll_percent: float
+) -> DropOutcome | None:
+    cumulative = 0.0
+    for drop in drops:
+        cumulative += drop.chance
+        if roll_percent < cumulative:
+            return drop
+    return None
+
+
 def format_duration(seconds: float) -> str:
     total = max(0, math.ceil(seconds))
     if total % 3600 == 0:
@@ -180,7 +258,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def panel_keyboard() -> InlineKeyboardMarkup:
+def panel_keyboard(activity_enabled: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -195,12 +273,98 @@ def panel_keyboard() -> InlineKeyboardMarkup:
                 ),
             ],
             [
+                InlineKeyboardButton(text="🔢 Угадай число", callback_data="game:guess"),
+                InlineKeyboardButton(text="🏎 Гонки", callback_data="game:race"),
+            ],
+            [InlineKeyboardButton(text="📦 Кейсы", callback_data="game:cases")],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "🔕 Выключить подарки за актив"
+                        if activity_enabled
+                        else "🔔 Включить подарки за актив"
+                    ),
+                    callback_data="game:activity",
+                )
+            ],
+            [
                 InlineKeyboardButton(text="ℹ️ Статус", callback_data="game:status"),
                 InlineKeyboardButton(text="⛔ Стоп", callback_data="game:stop"),
             ],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="panel:home")],
         ]
     )
+
+
+def cases_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать кейс", callback_data="case:create")],
+            [
+                InlineKeyboardButton(
+                    text="💾 Сохранённые кейсы", callback_data="case:saved"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📚 Сохранённые дропы", callback_data="case:drops"
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="panel:home")],
+        ]
+    )
+
+
+def case_drop_keyboard(has_drops: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить новый дроп", callback_data="case:add_drop")],
+        [
+            InlineKeyboardButton(
+                text="📚 Взять сохранённый дроп", callback_data="case:reuse_drop"
+            )
+        ]
+    ]
+    if has_drops:
+        rows.append(
+            [InlineKeyboardButton(text="✅ Дропы готовы", callback_data="case:drops_ready")]
+        )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="setup:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def saved_drops_keyboard(drops: list[SavedDrop]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for drop in drops[:25]:
+        label = f"{drop.name} — {format_chance(drop.chance)}%"
+        if len(label) > 48:
+            label = f"{label[:45]}…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label, callback_data=f"case:pick_drop:{drop.drop_id}"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="game:cases")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def saved_cases_keyboard(cases: list[SavedCase]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for saved_case in cases[:25]:
+        label = saved_case.name
+        if len(label) > 44:
+            label = f"{label[:41]}…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"▶️ {label}",
+                    callback_data=f"case:start:{saved_case.case_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="game:cases")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def choices_keyboard(chats: list[KnownChat]) -> InlineKeyboardMarkup:
@@ -224,7 +388,11 @@ class ContestBot:
         self.bot = bot
         self.settings = settings
         self.storage = storage
-        self.manager = ContestManager(self._announce_timed_winner)
+        self._random = secrets.SystemRandom()
+        self.manager = ContestManager(
+            self._announce_timed_winner,
+            timed_finish_handler=self._finish_timed_game,
+        )
         self.router = Router(name="monster-contests")
         self._register_handlers()
 
@@ -254,6 +422,42 @@ class ContestBot:
             self.cb_intercept_setup, F.data == "game:intercept"
         )
         self.router.callback_query.register(
+            self.cb_guess_setup, F.data == "game:guess"
+        )
+        self.router.callback_query.register(
+            self.cb_race_setup, F.data == "game:race"
+        )
+        self.router.callback_query.register(
+            self.cb_cases, F.data == "game:cases"
+        )
+        self.router.callback_query.register(
+            self.cb_create_case, F.data == "case:create"
+        )
+        self.router.callback_query.register(
+            self.cb_saved_cases, F.data == "case:saved"
+        )
+        self.router.callback_query.register(
+            self.cb_saved_drops, F.data == "case:drops"
+        )
+        self.router.callback_query.register(
+            self.cb_reuse_drop, F.data == "case:reuse_drop"
+        )
+        self.router.callback_query.register(
+            self.cb_add_case_drop, F.data == "case:add_drop"
+        )
+        self.router.callback_query.register(
+            self.cb_pick_saved_drop, F.data.startswith("case:pick_drop:")
+        )
+        self.router.callback_query.register(
+            self.cb_case_drops_ready, F.data == "case:drops_ready"
+        )
+        self.router.callback_query.register(
+            self.cb_start_saved_case, F.data.startswith("case:start:")
+        )
+        self.router.callback_query.register(
+            self.cb_toggle_activity, F.data == "game:activity"
+        )
+        self.router.callback_query.register(
             self.cb_status, F.data == "game:status"
         )
         self.router.callback_query.register(self.cb_stop, F.data == "game:stop")
@@ -265,6 +469,15 @@ class ContestBot:
         )
         self.router.callback_query.register(
             self.cb_skip_intercept_screenshot, F.data == "setup:intercept:skip"
+        )
+        self.router.callback_query.register(
+            self.cb_skip_guess_screenshot, F.data == "setup:guess:skip"
+        )
+        self.router.callback_query.register(
+            self.cb_skip_race_screenshot, F.data == "setup:race:skip"
+        )
+        self.router.callback_query.register(
+            self.cb_skip_case_screenshot, F.data == "setup:case:skip"
         )
 
         self.router.message.register(self.receive_casino_prize, CasinoSetup.prize)
@@ -285,6 +498,34 @@ class ContestBot:
         )
         self.router.message.register(
             self.receive_intercept_screenshot, InterceptSetup.screenshot
+        )
+        self.router.message.register(self.receive_guess_prize, GuessSetup.prize)
+        self.router.message.register(
+            self.receive_guess_screenshot, GuessSetup.screenshot
+        )
+        self.router.message.register(
+            self.receive_guess_number, GuessSetup.secret_number
+        )
+        self.router.message.register(self.receive_guess_stars, GuessSetup.stars)
+        self.router.message.register(self.receive_race_prize, RaceSetup.prize)
+        self.router.message.register(self.receive_race_stars, RaceSetup.stars)
+        self.router.message.register(
+            self.receive_race_duration, RaceSetup.duration
+        )
+        self.router.message.register(
+            self.receive_race_screenshot, RaceSetup.screenshot
+        )
+        self.router.message.register(self.receive_case_drop_name, CaseSetup.drop_name)
+        self.router.message.register(
+            self.receive_case_drop_chance, CaseSetup.drop_chance
+        )
+        self.router.message.register(self.receive_case_name, CaseSetup.name)
+        self.router.message.register(self.receive_case_stars, CaseSetup.stars)
+        self.router.message.register(
+            self.receive_case_duration, CaseSetup.duration
+        )
+        self.router.message.register(
+            self.receive_case_screenshot, CaseSetup.screenshot
         )
 
         self.router.message.register(self.on_message)
@@ -373,7 +614,9 @@ class ContestBot:
             "2. Через @BotFather отключите Privacy Mode, чтобы бот видел сообщения "
             "и слоты в группе.\n"
             "3. Отправьте в группе любое сообщение, чтобы она появилась в списке.\n"
-            "4. Откройте /contest, выберите группу, затем игру.\n\n"
+            "4. Для платных попыток включите платные сообщения в настройках "
+            "супергруппы и задайте ту же цену Stars, что в панели.\n"
+            "5. Откройте /contest, выберите группу, затем игру.\n\n"
             "<i>Все настройки выполняются только здесь, в личных сообщениях с ботом.</i>"
         )
 
@@ -387,14 +630,23 @@ class ContestBot:
         targets = self.storage.get_targets(user_id)
         group = self.storage.get_chat(targets.group_id)
         group_name = html.quote(group.title) if group else "<i>не выбран</i>"
+        activity = self.storage.is_activity_enabled(targets.group_id)
         return (
             "🎛 <b>Панель управления</b>\n\n"
             f"💬 <b>Группа игры:</b> {group_name}\n\n"
+            f"🔔 <b>Подарки за актив:</b> "
+            f"{'включены' if activity else 'выключены'}\n\n"
             "Выберите игру и заполните настройки."
         )
 
+    def _panel_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
+        targets = self.storage.get_targets(user_id)
+        return panel_keyboard(self.storage.is_activity_enabled(targets.group_id))
+
     async def _show_panel(self, message: Message, user_id: int) -> None:
-        await message.answer(self._panel_text(user_id), reply_markup=panel_keyboard())
+        await message.answer(
+            self._panel_text(user_id), reply_markup=self._panel_keyboard(user_id)
+        )
 
     async def cb_panel(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
@@ -403,7 +655,8 @@ class ContestBot:
         await callback.answer()
         if isinstance(callback.message, Message):
             await callback.message.edit_text(
-                self._panel_text(callback.from_user.id), reply_markup=panel_keyboard()
+                self._panel_text(callback.from_user.id),
+                reply_markup=self._panel_keyboard(callback.from_user.id),
             )
 
     async def _available_chats(
@@ -458,7 +711,8 @@ class ContestBot:
         self.storage.set_group(callback.from_user.id, chat_id)
         await callback.answer("Сохранено")
         await callback.message.edit_text(
-            self._panel_text(callback.from_user.id), reply_markup=panel_keyboard()
+            self._panel_text(callback.from_user.id),
+            reply_markup=self._panel_keyboard(callback.from_user.id),
         )
 
     async def _validate_targets(self, user_id: int) -> int | str:
@@ -470,6 +724,24 @@ class ContestBot:
         if not await self._is_bot_ready(targets.group_id):
             return "Назначьте бота администратором выбранной группы."
         return targets.group_id
+
+    async def _validate_paid_message_price(
+        self, group_id: int, stars: int
+    ) -> str | None:
+        if stars <= 0:
+            return None
+        try:
+            chat = await self.bot.get_chat(group_id)
+        except TelegramAPIError as exc:
+            return f"Не удалось проверить цену сообщений: {html.quote(str(exc))}"
+        configured = int(getattr(chat, "paid_message_star_count", 0) or 0)
+        if configured == stars:
+            return None
+        return (
+            "В настройках выбранной супергруппы включите платные сообщения и "
+            f"установите цену <b>{stars} ⭐️</b>. Сейчас Telegram сообщает цену "
+            f"<b>{configured} ⭐️</b>. После этого снова запустите игру."
+        )
 
     async def cb_casino_setup(
         self, callback: CallbackQuery, state: FSMContext
@@ -762,6 +1034,696 @@ class ContestBot:
             reply_markup=home_keyboard(),
         )
 
+    async def cb_guess_setup(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        targets = await self._validate_targets(callback.from_user.id)
+        if isinstance(targets, str):
+            await callback.answer(targets, show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(GuessSetup.prize)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "🔢 <b>Настройка «Угадай число»</b>\n\n"
+                "Введите приз текстом или ссылкой.",
+                reply_markup=back_keyboard(),
+            )
+
+    async def receive_guess_prize(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_access_message(message):
+            return
+        prize = (message.text or "").strip()
+        if not prize or len(prize) > 500:
+            await message.answer("Введите приз текстом, не длиннее 500 символов.")
+            return
+        await state.update_data(prize=prize)
+        await state.set_state(GuessSetup.screenshot)
+        await message.answer(
+            "Прикрепите скриншот приза как фото или файл-изображение.\n"
+            "Либо нажмите <i>«Без скриншота»</i>.",
+            reply_markup=screenshot_keyboard("guess"),
+        )
+
+    async def receive_guess_screenshot(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        screenshot = self._screenshot_from(message)
+        if screenshot is None:
+            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            return
+        await state.update_data(
+            screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
+        )
+        await self._continue_guess_setup(message, state)
+
+    async def cb_skip_guess_screenshot(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        if await state.get_state() != GuessSetup.screenshot.state:
+            await callback.answer("Настройка уже завершена", show_alert=True)
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._continue_guess_setup(callback.message, state)
+
+    async def _continue_guess_setup(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        await state.set_state(GuessSetup.secret_number)
+        await message.answer(
+            "Какое число должны угадать участники?\n"
+            "Введите целое число от <b>1 до 100</b>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_guess_number(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        raw = (message.text or "").strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= 100:
+            await message.answer("Введите целое число от 1 до 100.")
+            return
+        await state.update_data(secret_number=int(raw))
+        await state.set_state(GuessSetup.stars)
+        await message.answer(
+            "Сколько звёзд стоит одна попытка?\n"
+            "Введите целое число от <b>0 до 1 000 000</b>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_guess_stars(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        stars = parse_stars(message.text or "")
+        if stars is None:
+            await message.answer("Введите целое число от 0 до 1 000 000.")
+            return
+        await state.update_data(stars=stars)
+        await self._finish_guess_setup(message, state)
+
+    async def _finish_guess_setup(
+        self, message: Message, state: FSMContext, user_id: int | None = None
+    ) -> None:
+        operator_id = user_id or (message.from_user.id if message.from_user else 0)
+        targets = await self._validate_targets(operator_id)
+        if isinstance(targets, str):
+            await message.answer(targets, reply_markup=home_keyboard())
+            await state.clear()
+            return
+        group_id = targets
+        if await self.manager.snapshot(game_key(group_id)) is not None:
+            await message.answer(
+                "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
+                reply_markup=home_keyboard(),
+            )
+            await state.clear()
+            return
+        data = await state.get_data()
+        stars = int(data["stars"])
+        paid_error = await self._validate_paid_message_price(group_id, stars)
+        if paid_error:
+            await message.answer(paid_error, reply_markup=home_keyboard())
+            await state.clear()
+            return
+        prize = str(data["prize"])
+        secret_number = int(data["secret_number"])
+        try:
+            group_post = await self._send_public(
+                group_id,
+                self._tracking_text(self._guess_start_text(prize, stars)),
+                data.get("screenshot_kind"),
+                data.get("screenshot_file_id"),
+            )
+        except TelegramAPIError as exc:
+            await message.answer(
+                "Не удалось опубликовать игру: "
+                f"<code>{html.quote(str(exc))}</code>"
+            )
+            return
+        await self.manager.start_guess(
+            game_key(group_id),
+            secret_number,
+            prize=prize,
+            message_stars=stars,
+            tracking_after_message_id=group_post.message_id,
+        )
+        await state.clear()
+        await message.answer(
+            "✅ <b>«Угадай число» запущена.</b>", reply_markup=home_keyboard()
+        )
+
+    async def cb_race_setup(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        targets = await self._validate_targets(callback.from_user.id)
+        if isinstance(targets, str):
+            await callback.answer(targets, show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(RaceSetup.prize)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "🏎 <b>Настройка «Гонок»</b>\n\nВведите приз текстом или ссылкой.",
+                reply_markup=back_keyboard(),
+            )
+
+    async def receive_race_prize(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_access_message(message):
+            return
+        prize = (message.text or "").strip()
+        if not prize or len(prize) > 500:
+            await message.answer("Введите приз текстом, не длиннее 500 символов.")
+            return
+        await state.update_data(prize=prize)
+        await state.set_state(RaceSetup.stars)
+        await message.answer(
+            "Сколько звёзд стоит сообщение для участия?\n"
+            "Введите целое число от <b>0 до 1 000 000</b>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_race_stars(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_access_message(message):
+            return
+        stars = parse_stars(message.text or "")
+        if stars is None:
+            await message.answer("Введите целое число от 0 до 1 000 000.")
+            return
+        await state.update_data(stars=stars)
+        await state.set_state(RaceSetup.duration)
+        await message.answer(
+            "Сколько длится набор участников?\n"
+            "Введите <code>60</code>, <code>2м</code> или <code>1ч</code>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_race_duration(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        duration = parse_duration(message.text or "")
+        if duration is None:
+            await message.answer("Введите время от 10 секунд до 24 часов.")
+            return
+        await state.update_data(duration=duration)
+        await state.set_state(RaceSetup.screenshot)
+        await message.answer(
+            "Прикрепите скриншот приза или нажмите <i>«Без скриншота»</i>.",
+            reply_markup=screenshot_keyboard("race"),
+        )
+
+    async def receive_race_screenshot(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        screenshot = self._screenshot_from(message)
+        if screenshot is None:
+            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            return
+        await state.update_data(
+            screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
+        )
+        await self._finish_race_setup(message, state)
+
+    async def cb_skip_race_screenshot(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        if await state.get_state() != RaceSetup.screenshot.state:
+            await callback.answer("Настройка уже завершена", show_alert=True)
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._finish_race_setup(callback.message, state, callback.from_user.id)
+
+    async def _finish_race_setup(
+        self, message: Message, state: FSMContext, user_id: int | None = None
+    ) -> None:
+        operator_id = user_id or (message.from_user.id if message.from_user else 0)
+        targets = await self._validate_targets(operator_id)
+        if isinstance(targets, str):
+            await message.answer(targets, reply_markup=home_keyboard())
+            await state.clear()
+            return
+        group_id = targets
+        if await self.manager.snapshot(game_key(group_id)) is not None:
+            await message.answer(
+                "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
+                reply_markup=home_keyboard(),
+            )
+            await state.clear()
+            return
+        data = await state.get_data()
+        stars = int(data["stars"])
+        paid_error = await self._validate_paid_message_price(group_id, stars)
+        if paid_error:
+            await message.answer(paid_error, reply_markup=home_keyboard())
+            await state.clear()
+            return
+        prize = str(data["prize"])
+        duration = int(data["duration"])
+        try:
+            group_post = await self._send_public(
+                group_id,
+                self._tracking_text(self._race_start_text(prize, stars, duration)),
+                data.get("screenshot_kind"),
+                data.get("screenshot_file_id"),
+            )
+        except TelegramAPIError as exc:
+            await message.answer(
+                "Не удалось опубликовать гонку: "
+                f"<code>{html.quote(str(exc))}</code>"
+            )
+            return
+        await self.manager.start_race(
+            game_key(group_id),
+            duration,
+            prize=prize,
+            message_stars=stars,
+            tracking_after_message_id=group_post.message_id,
+        )
+        await state.clear()
+        await message.answer(
+            "✅ <b>Набор на гонку начался.</b>", reply_markup=home_keyboard()
+        )
+
+    async def cb_cases(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        targets = await self._validate_targets(callback.from_user.id)
+        if isinstance(targets, str):
+            await callback.answer(targets, show_alert=True)
+            return
+        await state.clear()
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(
+                "📦 <b>Кейсы</b>\n\n"
+                "Создайте новый кейс или запустите сохранённый.",
+                reply_markup=cases_keyboard(),
+            )
+
+    async def cb_create_case(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        targets = await self._validate_targets(callback.from_user.id)
+        if isinstance(targets, str):
+            await callback.answer(targets, show_alert=True)
+            return
+        await state.clear()
+        await state.set_data({"drop_ids": []})
+        await state.set_state(CaseSetup.drop_name)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "📦 <b>Новый кейс</b>\n\n"
+                "Введите название первого дропа, например <code>🧸 Мишка</code>.",
+                reply_markup=case_drop_keyboard(),
+            )
+
+    async def cb_add_case_drop(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        data = await state.get_data()
+        if "drop_ids" not in data:
+            await callback.answer("Сначала создайте кейс", show_alert=True)
+            return
+        if len(data.get("drop_ids", [])) >= 20:
+            await callback.answer("В одном кейсе максимум 20 дропов", show_alert=True)
+            return
+        await state.set_state(CaseSetup.drop_name)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "Введите название следующего дропа.",
+                reply_markup=case_drop_keyboard(bool(data.get("drop_ids"))),
+            )
+
+    async def receive_case_drop_name(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        name = (message.text or "").strip()
+        if not name or len(name) > 80:
+            await message.answer("Название дропа должно содержать от 1 до 80 символов.")
+            return
+        await state.update_data(pending_drop_name=name)
+        await state.set_state(CaseSetup.drop_chance)
+        await message.answer(
+            "Введите честный шанс выпадения этого дропа в процентах.\n"
+            "Например: <code>0.05</code>. Этот же процент будет показан в посте.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_case_drop_chance(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        chance = parse_chance(message.text or "")
+        if chance is None:
+            await message.answer("Введите процент числом от 0 до 100, например 0.05.")
+            return
+        data = await state.get_data()
+        drop_ids = [int(value) for value in data.get("drop_ids", [])]
+        existing = [
+            drop
+            for drop_id in drop_ids
+            if (drop := self.storage.get_drop(message.from_user.id, drop_id))
+            is not None
+        ]
+        if sum(drop.chance for drop in existing) + chance > 100.0000001:
+            await message.answer("Сумма шансов всех дропов не может превышать 100%.")
+            return
+        saved = self.storage.save_drop(
+            message.from_user.id, str(data["pending_drop_name"]), chance
+        )
+        drop_ids.append(saved.drop_id)
+        await state.update_data(drop_ids=drop_ids, pending_drop_name=None)
+        await state.set_state(CaseSetup.drops_ready)
+        await message.answer(
+            f"✅ Дроп <b>{html.quote(saved.name)}</b> сохранён отдельно.\n"
+            f"Шанс: <b>{format_chance(saved.chance)}%</b>.\n\n"
+            "Добавьте ещё один дроп или переходите к настройке кейса.",
+            reply_markup=case_drop_keyboard(True),
+        )
+
+    async def cb_reuse_drop(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        data = await state.get_data()
+        if "drop_ids" not in data:
+            await callback.answer("Сначала создайте кейс", show_alert=True)
+            return
+        drops = self.storage.list_drops(callback.from_user.id, 25)
+        if not drops:
+            await callback.answer("Сохранённых дропов пока нет", show_alert=True)
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "📚 <b>Выберите сохранённый дроп:</b>",
+                reply_markup=saved_drops_keyboard(drops),
+            )
+
+    async def cb_pick_saved_drop(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        data = await state.get_data()
+        if "drop_ids" not in data or not callback.data:
+            await callback.answer("Сначала создайте кейс", show_alert=True)
+            return
+        try:
+            drop_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный дроп", show_alert=True)
+            return
+        saved = self.storage.get_drop(callback.from_user.id, drop_id)
+        if saved is None:
+            await callback.answer("Дроп не найден", show_alert=True)
+            return
+        drop_ids = [int(value) for value in data.get("drop_ids", [])]
+        if len(drop_ids) >= 20:
+            await callback.answer("В одном кейсе максимум 20 дропов", show_alert=True)
+            return
+        current = [
+            drop
+            for current_id in drop_ids
+            if (drop := self.storage.get_drop(callback.from_user.id, current_id))
+            is not None
+        ]
+        if sum(drop.chance for drop in current) + saved.chance > 100.0000001:
+            await callback.answer("Сумма шансов превысит 100%", show_alert=True)
+            return
+        drop_ids.append(saved.drop_id)
+        await state.update_data(drop_ids=drop_ids)
+        await state.set_state(CaseSetup.drops_ready)
+        await callback.answer("Дроп добавлен")
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                f"✅ <b>{html.quote(saved.name)}</b> добавлен в кейс.",
+                reply_markup=case_drop_keyboard(True),
+            )
+
+    async def cb_case_drops_ready(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        data = await state.get_data()
+        drop_ids = [int(value) for value in data.get("drop_ids", [])]
+        if not drop_ids:
+            await callback.answer("Добавьте хотя бы один дроп", show_alert=True)
+            return
+        await state.set_state(CaseSetup.name)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "Введите название кейса.", reply_markup=back_keyboard()
+            )
+
+    async def receive_case_name(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_access_message(message):
+            return
+        name = (message.text or "").strip()
+        if not name or len(name) > 80:
+            await message.answer("Название кейса должно содержать от 1 до 80 символов.")
+            return
+        await state.update_data(case_name=name)
+        await state.set_state(CaseSetup.stars)
+        await message.answer(
+            "Сколько звёзд стоит одно открытие?\n"
+            "Введите целое число от <b>0 до 1 000 000</b>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_case_stars(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_access_message(message):
+            return
+        stars = parse_stars(message.text or "")
+        if stars is None:
+            await message.answer("Введите целое число от 0 до 1 000 000.")
+            return
+        await state.update_data(stars=stars)
+        await state.set_state(CaseSetup.duration)
+        await message.answer(
+            "Через сколько кейс закроется?\n"
+            "Введите <code>60</code>, <code>10м</code> или <code>1ч</code>.",
+            reply_markup=back_keyboard(),
+        )
+
+    async def receive_case_duration(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        duration = parse_duration(message.text or "")
+        if duration is None:
+            await message.answer("Введите время от 10 секунд до 24 часов.")
+            return
+        await state.update_data(duration=duration)
+        await state.set_state(CaseSetup.screenshot)
+        await message.answer(
+            "Прикрепите скриншот кейса или нажмите <i>«Без скриншота»</i>.",
+            reply_markup=screenshot_keyboard("case"),
+        )
+
+    async def receive_case_screenshot(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if not await self._require_access_message(message):
+            return
+        screenshot = self._screenshot_from(message)
+        if screenshot is None:
+            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            return
+        await state.update_data(
+            screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
+        )
+        await self._finish_case_setup(message, state)
+
+    async def cb_skip_case_screenshot(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        if await state.get_state() != CaseSetup.screenshot.state:
+            await callback.answer("Настройка уже завершена", show_alert=True)
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._finish_case_setup(callback.message, state, callback.from_user.id)
+
+    async def _finish_case_setup(
+        self, message: Message, state: FSMContext, user_id: int | None = None
+    ) -> None:
+        operator_id = user_id or (message.from_user.id if message.from_user else 0)
+        data = await state.get_data()
+        saved_case = self.storage.save_case(
+            operator_id,
+            str(data["case_name"]),
+            int(data["stars"]),
+            int(data["duration"]),
+            [int(value) for value in data["drop_ids"]],
+            screenshot_kind=data.get("screenshot_kind"),
+            screenshot_file_id=data.get("screenshot_file_id"),
+        )
+        await state.clear()
+        await self._launch_saved_case(message, operator_id, saved_case)
+
+    async def cb_saved_cases(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        await state.clear()
+        cases = self.storage.list_cases(callback.from_user.id)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            text = "💾 <b>Сохранённые кейсы</b>\n\nВыберите кейс для запуска."
+            if not cases:
+                text = "💾 Сохранённых кейсов пока нет."
+            await callback.message.edit_text(
+                text, reply_markup=saved_cases_keyboard(cases)
+            )
+
+    async def cb_saved_drops(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        await state.clear()
+        drops = self.storage.list_drops(callback.from_user.id, 30)
+        if drops:
+            lines = [
+                f"{index}. {html.quote(drop.name)} — <b>{format_chance(drop.chance)}%</b>"
+                for index, drop in enumerate(drops, 1)
+            ]
+            text = "📚 <b>Сохранённые дропы</b>\n\n" + "\n".join(lines)
+        else:
+            text = "📚 Сохранённых дропов пока нет."
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(text, reply_markup=cases_keyboard())
+
+    async def cb_start_saved_case(
+        self, callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        if not callback.data or not isinstance(callback.message, Message):
+            return
+        try:
+            case_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный кейс", show_alert=True)
+            return
+        saved_case = self.storage.get_case(callback.from_user.id, case_id)
+        if saved_case is None:
+            await callback.answer("Кейс не найден", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer()
+        await self._launch_saved_case(
+            callback.message, callback.from_user.id, saved_case
+        )
+
+    async def _launch_saved_case(
+        self, message: Message, operator_id: int, saved_case: SavedCase
+    ) -> None:
+        targets = await self._validate_targets(operator_id)
+        if isinstance(targets, str):
+            await message.answer(targets, reply_markup=home_keyboard())
+            return
+        group_id = targets
+        if await self.manager.snapshot(game_key(group_id)) is not None:
+            await message.answer(
+                "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
+                reply_markup=home_keyboard(),
+            )
+            return
+        paid_error = await self._validate_paid_message_price(group_id, saved_case.stars)
+        if paid_error:
+            await message.answer(paid_error, reply_markup=home_keyboard())
+            return
+        try:
+            group_post = await self._send_public(
+                group_id,
+                self._tracking_text(self._case_start_text(saved_case)),
+                saved_case.screenshot_kind,
+                saved_case.screenshot_file_id,
+            )
+        except TelegramAPIError as exc:
+            await message.answer(
+                "Не удалось опубликовать кейс: "
+                f"<code>{html.quote(str(exc))}</code>"
+            )
+            return
+        drops = tuple(DropOutcome(drop.name, drop.chance) for drop in saved_case.drops)
+        await self.manager.start_case(
+            game_key(group_id),
+            saved_case.name,
+            drops,
+            saved_case.duration_seconds,
+            message_stars=saved_case.stars,
+            tracking_after_message_id=group_post.message_id,
+        )
+        await message.answer(
+            "✅ <b>Кейс запущен и сохранён.</b>", reply_markup=home_keyboard()
+        )
+
+    async def cb_toggle_activity(self, callback: CallbackQuery) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        targets = await self._validate_targets(callback.from_user.id)
+        if isinstance(targets, str):
+            await callback.answer(targets, show_alert=True)
+            return
+        group_id = targets
+        enabled = not self.storage.is_activity_enabled(group_id)
+        if enabled:
+            try:
+                await self._send_public(group_id, self._activity_start_text())
+            except TelegramAPIError as exc:
+                await callback.answer(
+                    f"Не удалось включить: {str(exc)[:120]}", show_alert=True
+                )
+                return
+        self.storage.set_activity_enabled(group_id, enabled, callback.from_user.id)
+        await callback.answer("Настройка сохранена")
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(
+                self._panel_text(callback.from_user.id),
+                reply_markup=self._panel_keyboard(callback.from_user.id),
+            )
+
     async def cb_cancel_setup(
         self, callback: CallbackQuery, state: FSMContext
     ) -> None:
@@ -771,7 +1733,8 @@ class ContestBot:
         await callback.answer("Настройка отменена")
         if isinstance(callback.message, Message):
             await callback.message.answer(
-                self._panel_text(callback.from_user.id), reply_markup=panel_keyboard()
+                self._panel_text(callback.from_user.id),
+                reply_markup=self._panel_keyboard(callback.from_user.id),
             )
 
     async def cb_status(self, callback: CallbackQuery) -> None:
@@ -821,6 +1784,10 @@ class ContestBot:
         ):
             return
 
+        participant = participant_from(message.from_user)
+        if self.storage.is_activity_enabled(message.chat.id):
+            await self._process_activity_message(message, participant)
+
         key = game_key(message.chat.id)
         state = await self.manager.snapshot(key)
         if state is None:
@@ -830,7 +1797,6 @@ class ContestBot:
             and message.message_id <= state.tracking_after_message_id
         ):
             return
-        participant = participant_from(message.from_user)
 
         if state.kind is ContestType.INTERCEPT:
             update = await self.manager.submit_intercept(key, participant)
@@ -889,6 +1855,67 @@ class ContestBot:
                     f"{participant_link(participant)} — "
                     f"<b>{result.hits}/{result.target}</b>"
                 )
+            return
+
+        if state.kind is ContestType.GUESS:
+            if not paid_message_is_valid(message, state.message_stars):
+                return
+            raw = (message.text or "").strip()
+            if not raw.isdigit() or not 1 <= int(raw) <= 100:
+                return
+            result = await self.manager.submit_guess(key, participant, int(raw))
+            if result is not None:
+                winner, finished_state = result
+                await message.reply(
+                    f"🔢 <b>Число {finished_state.secret_number} угадано!</b>"
+                )
+                await self._announce_winner(key, winner, finished_state)
+            return
+
+        if state.kind is ContestType.RACE:
+            if not paid_message_is_valid(message, state.message_stars):
+                return
+            update = await self.manager.submit_race(key, participant)
+            if update and update.accepted:
+                await message.reply(
+                    f"🏎 {participant_link(participant)}, вы в гонке! "
+                    f"Участников: <b>{update.participant_count}</b>."
+                )
+            return
+
+        if state.kind is ContestType.CASE:
+            if not paid_message_is_valid(message, state.message_stars):
+                return
+            opened = await self.manager.open_case(key, message.message_id)
+            if opened is None:
+                return
+            if opened.outcome is None:
+                await message.reply(
+                    f"📦 <b>{html.quote(opened.state.case_name)}</b> открыт. "
+                    "В этот раз кейс пуст."
+                )
+            else:
+                await message.reply(
+                    f"📦 <b>{html.quote(opened.state.case_name)}</b> открыт!\n"
+                    f"🎁 {participant_link(participant)} получает "
+                    f"<b>{html.quote(opened.outcome.name)}</b>.\n\n"
+                    f"<b>{html.quote(self.settings.prize_call)}</b>"
+                )
+            return
+
+    async def _process_activity_message(
+        self, message: Message, participant: Participant
+    ) -> None:
+        drop = select_drop(ACTIVITY_DROPS, self._random.random() * 100)
+        if drop is None:
+            return
+        text = (
+            "🎁 <b>Подарок за актив!</b>\n\n"
+            f"{participant_link(participant)} получает "
+            f"<b>{html.quote(drop.name)}</b>.\n\n"
+            f"<b>{html.quote(self.settings.prize_call)}</b>"
+        )
+        await self._reply_with_fallback(message, text)
 
     async def _reply_with_fallback(self, message: Message, text: str) -> None:
         try:
@@ -903,12 +1930,24 @@ class ContestBot:
         screenshot_kind: object = None,
         screenshot_file_id: object = None,
     ) -> Message:
+        media_kind = screenshot_kind
+        if (
+            len(text) > 900
+            and isinstance(screenshot_file_id, str)
+            and media_kind in {"photo", "document"}
+        ):
+            if media_kind == "photo":
+                await self.bot.send_photo(chat_id, screenshot_file_id)
+            else:
+                await self.bot.send_document(chat_id, screenshot_file_id)
+            media_kind = None
+
         async def send(value: str) -> Message:
-            if screenshot_kind == "photo" and isinstance(screenshot_file_id, str):
+            if media_kind == "photo" and isinstance(screenshot_file_id, str):
                 return await self.bot.send_photo(
                     chat_id, screenshot_file_id, caption=value
                 )
-            if screenshot_kind == "document" and isinstance(screenshot_file_id, str):
+            if media_kind == "document" and isinstance(screenshot_file_id, str):
                 return await self.bot.send_document(
                     chat_id, screenshot_file_id, caption=value
                 )
@@ -951,6 +1990,137 @@ class ContestBot:
             f"<i>{format_prize(prize)}</i>"
         )
 
+    @staticmethod
+    def _price_text(stars: int) -> str:
+        return "бесплатно" if stars == 0 else f"{stars} ⭐️"
+
+    def _guess_start_text(self, prize: str, stars: int) -> str:
+        return (
+            "🔢 <b>Игра «Угадай число» началась!</b>\n\n"
+            f"🎁 <b>Приз:</b> <i>{format_prize(prize)}</i>\n"
+            "🎯 <b>Диапазон:</b> от 1 до 100\n"
+            f"⭐️ <b>Одна попытка:</b> {self._price_text(stars)}\n\n"
+            "Отправляйте число отдельным сообщением. Первый правильный ответ победит."
+        )
+
+    def _race_start_text(self, prize: str, stars: int, seconds: int) -> str:
+        return (
+            "🏎 <b>Набор участников на гонку!</b>\n\n"
+            f"🎁 <b>Приз:</b> <i>{format_prize(prize)}</i>\n"
+            f"⭐️ <b>Сообщение для участия:</b> {self._price_text(stars)}\n"
+            f"⏰ <b>Набор длится:</b> {format_duration(seconds)}\n\n"
+            "Отправьте одно сообщение после этого поста. Каждый пользователь "
+            "попадает в гонку один раз. После набора машины стартуют автоматически."
+        )
+
+    def _case_start_text(self, saved_case: SavedCase) -> str:
+        lines = [
+            f"{index}. {html.quote(drop.name)} — {format_chance(drop.chance)}%"
+            for index, drop in enumerate(saved_case.drops, 1)
+        ]
+        chances = "\n".join(lines)
+        return (
+            f"📦 <b>Кейс «{html.quote(saved_case.name)}» открыт!</b>\n\n"
+            f"⭐️ <b>Стоимость открытия:</b> {self._price_text(saved_case.stars)}\n"
+            f"⏰ <b>Закроется через:</b> "
+            f"{format_duration(saved_case.duration_seconds)}\n\n"
+            "🔔 <b>Шансы на дроп:</b>\n\n"
+            f"<blockquote>{chances}</blockquote>\n\n"
+            "Одно сообщение после этого поста = одно открытие. Всем удачи!"
+        )
+
+    @staticmethod
+    def _activity_start_text() -> str:
+        drop_lines = []
+        for index, (drop, emoji_id) in enumerate(
+            zip(ACTIVITY_DROPS, ACTIVITY_IDS[1:5], strict=True), 1
+        ):
+            drop_lines.append(
+                f"{index}. {premium(emoji_id, drop.name)} — "
+                f"{format_chance(drop.chance)}%"
+            )
+        drop_text = "\n".join(drop_lines)
+        return (
+            f"{premium(ACTIVITY_IDS[0], '🔔')} <b>Шансы на дроп:</b>\n\n"
+            f"<blockquote>{drop_text}</blockquote>\n\n"
+            f"{premium(ACTIVITY_IDS[5], '👋')} <b>Всем удачи!</b>\n\n"
+            "Каждое обычное сообщение в чате участвует в постоянном розыгрыше."
+        )
+
+    async def _finish_timed_game(
+        self, key: ContestKey, state: ContestState
+    ) -> None:
+        if state.kind is ContestType.RACE:
+            await self._finish_race(key, state)
+        elif state.kind is ContestType.CASE:
+            try:
+                await self._send_public(
+                    key[0],
+                    f"📦 <b>Кейс «{html.quote(state.case_name)}» закрыт.</b>"
+                )
+            except TelegramAPIError:
+                logger.exception("Could not announce case expiration")
+
+    async def _finish_race(self, key: ContestKey, state: ContestState) -> None:
+        participants = list(state.participants.values())
+        if not participants:
+            try:
+                await self._send_public(
+                    key[0], "🏎 <b>Гонка отменена:</b> участников нет."
+                )
+            except TelegramAPIError:
+                logger.exception("Could not announce empty race")
+            return
+
+        winner = self._random.choice(participants)
+        frames = self._race_frames(participants, winner)
+        try:
+            race_message = await self._send_public(key[0], frames[0])
+            for frame in frames[1:]:
+                await asyncio.sleep(0.65)
+                try:
+                    await race_message.edit_text(frame)
+                except TelegramBadRequest:
+                    logger.debug("Race frame was not changed")
+            await asyncio.sleep(0.8)
+            await self._announce_winner(key, winner, state)
+        except TelegramAPIError:
+            logger.exception("Could not animate race")
+
+    def _race_frames(
+        self, participants: list[Participant], winner: Participant
+    ) -> list[str]:
+        visible = participants[:30]
+        if winner not in visible:
+            visible[-1] = winner
+        positions = {participant.user_id: 0 for participant in visible}
+        frames: list[str] = []
+        for step in range(7):
+            if step:
+                for participant in visible:
+                    if participant.user_id == winner.user_id:
+                        positions[participant.user_id] = min(10, step * 2)
+                    else:
+                        positions[participant.user_id] = min(
+                            9,
+                            positions[participant.user_id] + self._random.randint(0, 2),
+                        )
+            lines = []
+            for participant in visible:
+                position = positions[participant.user_id]
+                track = "·" * position + "🏎" + "·" * (10 - position) + "🏁"
+                nickname = (
+                    f"@{participant.username}"
+                    if participant.username
+                    else participant.full_name
+                )
+                lines.append(f"{track} {html.quote(nickname)}")
+            if len(participants) > len(visible):
+                lines.append(f"…и ещё {len(participants) - len(visible)} участников")
+            title = "🏁 <b>Финиш!</b>" if step == 6 else "🏎 <b>Гонка идёт!</b>"
+            frames.append(f"{title}\n\n" + "\n".join(lines))
+        return frames
+
     def _winner_text(
         self, winner: Participant, state: ContestState
     ) -> str:
@@ -958,6 +2128,10 @@ class ContestBot:
             title = "Казино завершено!"
         elif state.kind is ContestType.INTERCEPT:
             title = "Игра «Перебив» завершена!"
+        elif state.kind is ContestType.GUESS:
+            title = "Число угадано!"
+        elif state.kind is ContestType.RACE:
+            title = "Гонка завершена!"
         else:
             title = "Игра завершена!"
         return (
@@ -1006,6 +2180,33 @@ class ContestBot:
                 "🎰 <b>Казино 777 активно.</b>\n"
                 f"Для победы нужно выбить 777: <b>{state.jackpot_target} раз.</b>\n"
                 f"Приз: <i>{format_prize(state.prize)}</i>"
+            )
+        if state.kind is ContestType.GUESS:
+            return (
+                "🔢 <b>«Угадай число» активна.</b>\n"
+                f"Одна попытка: <b>{self._price_text(state.message_stars)}</b>\n"
+                f"Приз: <i>{format_prize(state.prize)}</i>"
+            )
+        if state.kind is ContestType.RACE:
+            remaining = max(
+                0,
+                math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
+            )
+            return (
+                "🏎 <b>Идёт набор на гонку.</b>\n"
+                f"Участников: <b>{len(state.participants)}</b>\n"
+                f"Осталось: <b>{format_duration(remaining)}</b>\n"
+                f"Приз: <i>{format_prize(state.prize)}</i>"
+            )
+        if state.kind is ContestType.CASE:
+            remaining = max(
+                0,
+                math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
+            )
+            return (
+                f"📦 <b>Кейс «{html.quote(state.case_name)}» активен.</b>\n"
+                f"Дропов: <b>{len(state.case_drops)}</b>\n"
+                f"Осталось: <b>{format_duration(remaining)}</b>"
             )
         return "Игра активна."
 

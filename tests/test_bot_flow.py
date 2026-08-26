@@ -12,7 +12,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from app.bot import CasinoSetup, ContestBot, InterceptSetup, game_key
+from app.bot import (
+    CaseSetup,
+    CasinoSetup,
+    ContestBot,
+    GuessSetup,
+    InterceptSetup,
+    game_key,
+)
 from app.config import Settings
 from app.storage import BotStorage
 
@@ -41,6 +48,7 @@ class FakeGroupMessage:
         is_automatic_forward: bool = False,
         text: str | None = None,
         message_id: int = 10,
+        paid_star_count: int | None = None,
     ) -> None:
         self.chat = SimpleNamespace(
             id=-1001,
@@ -58,6 +66,7 @@ class FakeGroupMessage:
         self.is_automatic_forward = is_automatic_forward
         self.text = text
         self.message_id = message_id
+        self.paid_star_count = paid_star_count
         self.dice = (
             SimpleNamespace(emoji="🎰", value=value) if value is not None else None
         )
@@ -239,6 +248,77 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.tracking_after_message_id, 1)
         self.assertIsNone(await self.state.get_state())
         self.assertEqual(self.bot.send_message.await_count, 1)
+
+    async def test_guess_form_and_paid_answer(self) -> None:
+        self._prepare_targets()
+        await self.state.set_state(GuessSetup.stars)
+        await self.state.set_data(
+            {"prize": "NFT prize", "secret_number": 42, "stars": 0}
+        )
+        setup_message = FakeMessage()
+        await self.contest_bot._finish_guess_setup(setup_message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(active.secret_number, 42)
+        await self.contest_bot.manager.stop(game_key(-1001))
+        await self.contest_bot.manager.start_guess(
+            game_key(-1001), 42, prize="NFT prize", message_stars=10
+        )
+        self.contest_bot._announce_winner = AsyncMock()
+
+        unpaid = FakeGroupMessage(text="42", message_id=20, paid_star_count=9)
+        paid = FakeGroupMessage(text="42", message_id=21, paid_star_count=10)
+        await self.contest_bot.on_message(unpaid)
+        self.assertIsNotNone(await self.contest_bot.manager.snapshot(game_key(-1001)))
+        await self.contest_bot.on_message(paid)
+
+        self.assertTrue(paid.replies)
+        self.contest_bot._announce_winner.assert_awaited_once()
+        self.assertIsNone(await self.contest_bot.manager.snapshot(game_key(-1001)))
+
+    async def test_race_counts_a_paid_user_only_once(self) -> None:
+        await self.contest_bot.manager.start_race(
+            game_key(-1001), 60, message_stars=5
+        )
+        unpaid = FakeGroupMessage(text="go", message_id=30, paid_star_count=4)
+        paid = FakeGroupMessage(text="go", message_id=31, paid_star_count=5)
+        duplicate = FakeGroupMessage(text="again", message_id=32, paid_star_count=5)
+        await self.contest_bot.on_message(unpaid)
+        await self.contest_bot.on_message(paid)
+        await self.contest_bot.on_message(duplicate)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(len(active.participants), 1)
+        self.assertEqual(len(paid.replies), 1)
+        self.assertEqual(duplicate.replies, [])
+
+    async def test_case_is_saved_and_started(self) -> None:
+        self._prepare_targets()
+        saved_drop = self.storage.save_drop(42, "🧸", 0.05)
+        await self.state.set_state(CaseSetup.screenshot)
+        await self.state.set_data(
+            {
+                "case_name": "Lucky",
+                "stars": 0,
+                "duration": 60,
+                "drop_ids": [saved_drop.drop_id],
+            }
+        )
+
+        message = FakeMessage()
+        await self.contest_bot._finish_case_setup(message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(active.kind.value, "case")
+        self.assertEqual(active.case_name, "Lucky")
+        self.assertEqual(len(self.storage.list_cases(42)), 1)
+
+    async def test_activity_post_discloses_real_chances(self) -> None:
+        text = self.contest_bot._activity_start_text()
+        self.assertIn("0.05%", text)
+        self.assertIn("0.04%", text)
+        self.assertIn("0.03%", text)
+        self.assertNotIn("0.1%", text)
 
 
 if __name__ == "__main__":

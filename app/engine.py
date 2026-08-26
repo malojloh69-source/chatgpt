@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -16,6 +17,8 @@ class ContestType(StrEnum):
     INTERCEPT = "intercept"
     CASINO = "casino"
     GUESS = "guess"
+    RACE = "race"
+    CASE = "case"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +26,12 @@ class Participant:
     user_id: int
     full_name: str
     username: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DropOutcome:
+    name: str
+    chance: float
 
 
 @dataclass(slots=True)
@@ -40,12 +49,17 @@ class ContestState:
     jackpot_target: int = 1
     jackpot_hits: dict[int, int] = field(default_factory=dict)
     spin_available_at: dict[int, float] = field(default_factory=dict)
+    participants: dict[int, Participant] = field(default_factory=dict)
+    case_name: str = ""
+    case_drops: tuple[DropOutcome, ...] = ()
+    processed_message_ids: set[int] = field(default_factory=set)
     generation: int = 0
 
 
 TimedWinnerHandler = Callable[
     [ContestKey, Participant, ContestState], Awaitable[None]
 ]
+TimedFinishHandler = Callable[[ContestKey, ContestState], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +91,18 @@ class CasinoSpinUpdate:
     finished_state: ContestState | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RaceJoinUpdate:
+    accepted: bool
+    participant_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CaseOpenUpdate:
+    outcome: DropOutcome | None
+    state: ContestState
+
+
 class ContestManager:
     """Keeps one active contest per selected group."""
 
@@ -84,8 +110,10 @@ class ContestManager:
         self,
         timed_winner_handler: TimedWinnerHandler,
         *,
+        timed_finish_handler: TimedFinishHandler | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        random_value: Callable[[], float] | None = None,
     ) -> None:
         self._states: dict[ContestKey, ContestState] = {}
         self._timers: dict[ContestKey, asyncio.Task[None]] = {}
@@ -93,6 +121,8 @@ class ContestManager:
         self._clock = clock
         self._sleep = sleep
         self._timed_winner_handler = timed_winner_handler
+        self._timed_finish_handler = timed_finish_handler
+        self._random_value = random_value or secrets.SystemRandom().random
         self._next_game_id = 1
 
     def _new_state(
@@ -118,6 +148,9 @@ class ContestManager:
             state,
             jackpot_hits=dict(state.jackpot_hits),
             spin_available_at=dict(state.spin_available_at),
+            participants=dict(state.participants),
+            case_drops=tuple(state.case_drops),
+            processed_message_ids=set(state.processed_message_ids),
         )
 
     def _cancel_timer_locked(self, key: ContestKey) -> None:
@@ -177,10 +210,13 @@ class ContestManager:
         secret_number: int,
         *,
         prize: str = "",
+        message_stars: int = 0,
         tracking_after_message_id: int | None = None,
     ) -> ContestState:
         if not 1 <= secret_number <= 100:
             raise ValueError("secret_number must be between 1 and 100")
+        if message_stars < 0:
+            raise ValueError("message_stars must not be negative")
         async with self._lock:
             self._cancel_timer_locked(key)
             state = self._new_state(
@@ -189,7 +225,74 @@ class ContestManager:
                 tracking_after_message_id=tracking_after_message_id,
             )
             state.secret_number = secret_number
+            state.message_stars = message_stars
             self._states[key] = state
+            return self._copy_state(state)
+
+    async def start_race(
+        self,
+        key: ContestKey,
+        seconds: float,
+        *,
+        prize: str = "",
+        message_stars: int = 0,
+        tracking_after_message_id: int | None = None,
+    ) -> ContestState:
+        if seconds <= 0:
+            raise ValueError("seconds must be positive")
+        if message_stars < 0:
+            raise ValueError("message_stars must not be negative")
+        async with self._lock:
+            self._cancel_timer_locked(key)
+            state = self._new_state(
+                ContestType.RACE,
+                prize=prize,
+                tracking_after_message_id=tracking_after_message_id,
+            )
+            state.message_stars = message_stars
+            state.deadline = self._clock() + seconds
+            self._states[key] = state
+            self._timers[key] = asyncio.create_task(
+                self._run_deadline_timer(key, state.game_id),
+                name=f"race-{key[0]}-{state.game_id}",
+            )
+            return self._copy_state(state)
+
+    async def start_case(
+        self,
+        key: ContestKey,
+        case_name: str,
+        drops: tuple[DropOutcome, ...],
+        seconds: float,
+        *,
+        message_stars: int = 0,
+        tracking_after_message_id: int | None = None,
+    ) -> ContestState:
+        if not case_name.strip() or not drops:
+            raise ValueError("case name and drops are required")
+        if seconds <= 0:
+            raise ValueError("seconds must be positive")
+        if message_stars < 0:
+            raise ValueError("message_stars must not be negative")
+        if any(drop.chance < 0 or drop.chance > 100 for drop in drops):
+            raise ValueError("drop chances must be between 0 and 100")
+        if sum(drop.chance for drop in drops) > 100.0000001:
+            raise ValueError("total drop chance must not exceed 100")
+        async with self._lock:
+            self._cancel_timer_locked(key)
+            state = self._new_state(
+                ContestType.CASE,
+                tracking_after_message_id=tracking_after_message_id,
+            )
+            state.case_name = case_name.strip()
+            state.case_drops = tuple(drops)
+            state.message_stars = message_stars
+            state.deadline = self._clock() + seconds
+            self._states[key] = state
+            self._timers[key] = asyncio.create_task(
+                self._run_deadline_timer(key, state.game_id),
+                name=f"case-{key[0]}-{state.game_id}",
+            )
             return self._copy_state(state)
 
     async def stop(self, key: ContestKey) -> ContestState | None:
@@ -276,6 +379,65 @@ class ContestManager:
             finished_state = self._copy_state(state)
             self._states.pop(key, None)
             return participant, finished_state
+
+    async def submit_race(
+        self, key: ContestKey, participant: Participant
+    ) -> RaceJoinUpdate | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind is not ContestType.RACE:
+                return None
+            if participant.user_id in state.participants:
+                return RaceJoinUpdate(False, len(state.participants))
+            state.participants[participant.user_id] = participant
+            return RaceJoinUpdate(True, len(state.participants))
+
+    async def open_case(
+        self, key: ContestKey, message_id: int
+    ) -> CaseOpenUpdate | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None or state.kind is not ContestType.CASE:
+                return None
+            if message_id in state.processed_message_ids:
+                return None
+            state.processed_message_ids.add(message_id)
+            roll = self._random_value() * 100
+            cumulative = 0.0
+            outcome: DropOutcome | None = None
+            for drop in state.case_drops:
+                cumulative += drop.chance
+                if roll < cumulative:
+                    outcome = drop
+                    break
+            return CaseOpenUpdate(outcome, self._copy_state(state))
+
+    async def _run_deadline_timer(self, key: ContestKey, game_id: int) -> None:
+        try:
+            while True:
+                async with self._lock:
+                    state = self._states.get(key)
+                    if (
+                        state is None
+                        or state.game_id != game_id
+                        or state.kind not in {ContestType.RACE, ContestType.CASE}
+                        or state.deadline is None
+                    ):
+                        return
+                    remaining = state.deadline - self._clock()
+                    if remaining <= 0:
+                        finished_state = self._copy_state(state)
+                        self._states.pop(key, None)
+                        self._timers.pop(key, None)
+                        break
+                await self._sleep(remaining)
+            if self._timed_finish_handler is not None:
+                try:
+                    await self._timed_finish_handler(key, finished_state)
+                except Exception:
+                    logger.exception("Could not finish timed contest")
+        except asyncio.CancelledError:
+            return
 
     async def reserve_spin(
         self, key: ContestKey, user_id: int, cooldown_seconds: float

@@ -6,6 +6,7 @@ import unittest
 from app.engine import (
     ContestManager,
     ContestType,
+    DropOutcome,
     Participant,
     SpinStatus,
 )
@@ -113,6 +114,63 @@ class ContestManagerTests(unittest.IsolatedAsyncioTestCase):
         state = await self.manager.snapshot(self.key)
         self.assertIsNotNone(state)
         self.assertEqual(state.kind, ContestType.CASINO)
+
+    async def test_race_registers_each_user_once(self) -> None:
+        await self.manager.start_race(self.key, 60, message_stars=5)
+        first = await self.manager.submit_race(self.key, self.alice)
+        duplicate = await self.manager.submit_race(self.key, self.alice)
+        second = await self.manager.submit_race(self.key, self.bob)
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(duplicate.accepted)
+        self.assertTrue(second.accepted)
+        self.assertEqual(second.participant_count, 2)
+        state = await self.manager.snapshot(self.key)
+        self.assertEqual(state.message_stars, 5)
+        self.assertEqual(set(state.participants), {1, 2})
+
+    async def test_case_has_one_opening_per_message_and_uses_exact_odds(self) -> None:
+        async def ignore_winner(key, participant, state):
+            return None
+
+        manager = ContestManager(ignore_winner, random_value=lambda: 0.0004)
+        try:
+            await manager.start_case(
+                self.key,
+                "Lucky",
+                (DropOutcome("🧸", 0.05), DropOutcome("💎", 0.03)),
+                60,
+            )
+            opened = await manager.open_case(self.key, 100)
+            duplicate = await manager.open_case(self.key, 100)
+            self.assertIsNotNone(opened)
+            self.assertEqual(opened.outcome.name, "🧸")
+            self.assertIsNone(duplicate)
+        finally:
+            await manager.close()
+
+    async def test_race_timer_returns_all_participants(self) -> None:
+        finishes = []
+
+        async def ignore_winner(key, participant, state):
+            return None
+
+        async def collect_finish(key, state):
+            finishes.append((key, state))
+
+        manager = ContestManager(
+            ignore_winner,
+            timed_finish_handler=collect_finish,
+        )
+        try:
+            await manager.start_race(self.key, 0.03, prize="Prize")
+            await manager.submit_race(self.key, self.alice)
+            await asyncio.sleep(0.06)
+            self.assertEqual(len(finishes), 1)
+            self.assertEqual(finishes[0][1].participants[1], self.alice)
+            self.assertIsNone(await manager.snapshot(self.key))
+        finally:
+            await manager.close()
 
 
 if __name__ == "__main__":
