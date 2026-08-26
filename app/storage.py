@@ -17,7 +17,6 @@ class KnownChat:
 @dataclass(frozen=True, slots=True)
 class UserTargets:
     group_id: int | None = None
-    channel_id: int | None = None
 
 
 class BotStorage:
@@ -51,8 +50,7 @@ class BotStorage:
                 );
                 CREATE TABLE IF NOT EXISTS user_targets (
                     user_id INTEGER PRIMARY KEY,
-                    group_id INTEGER,
-                    channel_id INTEGER
+                    group_id INTEGER
                 );
                 """
             )
@@ -142,12 +140,12 @@ class BotStorage:
     def get_targets(self, user_id: int) -> UserTargets:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT group_id, channel_id FROM user_targets WHERE user_id=?",
+                "SELECT group_id FROM user_targets WHERE user_id=?",
                 (user_id,),
             ).fetchone()
         if row is None:
             return UserTargets()
-        return UserTargets(group_id=row["group_id"], channel_id=row["channel_id"])
+        return UserTargets(group_id=row["group_id"])
 
     def set_group(self, user_id: int, chat_id: int) -> None:
         with self._connect() as connection:
@@ -156,17 +154,6 @@ class BotStorage:
                 INSERT INTO user_targets(user_id, group_id)
                 VALUES (?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET group_id=excluded.group_id
-                """,
-                (user_id, chat_id),
-            )
-
-    def set_channel(self, user_id: int, chat_id: int) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO user_targets(user_id, channel_id)
-                VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET channel_id=excluded.channel_id
                 """,
                 (user_id, chat_id),
             )
