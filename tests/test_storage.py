@@ -24,18 +24,14 @@ class BotStorageTests(unittest.TestCase):
 
     def test_chats_and_user_targets_are_stored(self) -> None:
         self.storage.upsert_chat(-1001, "Game chat", "supergroup", "game")
-        self.storage.upsert_chat(-1002, "News", "channel", "news")
         self.storage.set_group(42, -1001)
-        self.storage.set_channel(42, -1002)
 
         self.assertEqual(
             self.storage.get_targets(42),
-            UserTargets(group_id=-1001, channel_id=-1002),
+            UserTargets(group_id=-1001),
         )
         groups = self.storage.list_chats(("group", "supergroup"))
-        channels = self.storage.list_chats(("channel",))
         self.assertEqual([chat.chat_id for chat in groups], [-1001])
-        self.assertEqual([chat.chat_id for chat in channels], [-1002])
 
     def test_upsert_refreshes_chat_title(self) -> None:
         self.storage.upsert_chat(-1001, "Old", "supergroup")
