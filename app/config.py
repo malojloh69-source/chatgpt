@@ -39,8 +39,11 @@ def _parse_owner_ids(raw: str) -> frozenset[int]:
 class Settings:
     bot_token: str
     owner_ids: frozenset[int]
-    access_code: str
-    database_path: Path
+    access_code: str = "/MonsterLydka1488"
+    data_file: str = "monster_bot.sqlite3"
+    intercept_seconds: int = 120
+    casino_cooldown_seconds: float = 3.0
+    prize_call: str = "@Monster_Tags, выдай приз победителю!"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -51,14 +54,25 @@ class Settings:
                 "Не задан BOT_TOKEN. Скопируйте .env.example в .env и вставьте токен бота."
             )
 
+        intercept_seconds = int(os.getenv("INTERCEPT_SECONDS", "120"))
+        if not 10 <= intercept_seconds <= 3600:
+            raise RuntimeError("INTERCEPT_SECONDS должен быть от 10 до 3600")
+
+        casino_cooldown = float(os.getenv("CASINO_COOLDOWN_SECONDS", "3"))
+        if not 0 <= casino_cooldown <= 60:
+            raise RuntimeError("CASINO_COOLDOWN_SECONDS должен быть от 0 до 60")
+
         return cls(
             bot_token=token,
             owner_ids=_parse_owner_ids(os.getenv("OWNER_IDS", "")),
-            access_code=os.getenv("ACCESS_CODE", "MonsterLydka1488").strip().lstrip("/"),
-            database_path=Path(
-                os.getenv(
-                    "DATABASE_PATH",
-                    str(Path(__file__).resolve().parent.parent / "data" / "bot.sqlite3"),
-                )
-            ),
+            access_code=os.getenv("ACCESS_CODE", "/MonsterLydka1488").strip()
+            or "/MonsterLydka1488",
+            data_file=os.getenv("DATA_FILE", "monster_bot.sqlite3").strip()
+            or "monster_bot.sqlite3",
+            intercept_seconds=intercept_seconds,
+            casino_cooldown_seconds=casino_cooldown,
+            prize_call=os.getenv(
+                "PRIZE_CALL", "@Monster_Tags, выдай приз победителю!"
+            ).strip()
+            or "@Monster_Tags, выдай приз победителю!",
         )

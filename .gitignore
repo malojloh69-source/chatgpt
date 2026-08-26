@@ -1,6 +1,8 @@
 .env
 .venv/
 __pycache__/
+monster_bot.sqlite3
+monster_bot.sqlite3-shm
+monster_bot.sqlite3-wal
 *.py[cod]
 .pytest_cache/
-data/*.sqlite3*

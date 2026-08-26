@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from aiogram import Bot
+from aiogram.enums import ChatMemberStatus
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from app.bot import CasinoSetup, ContestBot, InterceptSetup, game_key
+from app.config import Settings
+from app.storage import BotStorage
+
+
+class FakeMessage:
+    def __init__(self, text: str | None = None, user_id: int = 42) -> None:
+        # Keep type as a plain string: this matches the representation that
+        # exposed the original identity-comparison bug.
+        self.chat = SimpleNamespace(type="private")
+        self.from_user = SimpleNamespace(id=user_id)
+        self.text = text
+        self.answers: list[tuple[str, object | None]] = []
+
+    async def answer(self, text: str, reply_markup=None):
+        self.answers.append((text, reply_markup))
+
+
+class FakeGroupMessage:
+    def __init__(
+        self,
+        *,
+        value: int | None = None,
+        user_id: int = 100,
+        is_bot: bool = False,
+        sender_chat=None,
+        is_automatic_forward: bool = False,
+        text: str | None = None,
+    ) -> None:
+        self.chat = SimpleNamespace(
+            id=-1001,
+            type="supergroup",
+            title="Game chat",
+            username="game_chat",
+        )
+        self.from_user = SimpleNamespace(
+            id=user_id,
+            is_bot=is_bot,
+            full_name="Player",
+            username="player",
+        )
+        self.sender_chat = sender_chat
+        self.is_automatic_forward = is_automatic_forward
+        self.text = text
+        self.dice = (
+            SimpleNamespace(emoji="🎰", value=value) if value is not None else None
+        )
+        self.replies: list[str] = []
+
+    async def reply(self, text: str):
+        self.replies.append(text)
+
+
+class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        settings = Settings(
+            "123456789:" + "A" * 35, frozenset()
+        )
+        self.bot = Bot(settings.bot_token)
+        self.storage = BotStorage(Path(self.temp_dir.name) / "bot.sqlite3")
+        self.contest_bot = ContestBot(self.bot, settings, self.storage)
+        self.memory = MemoryStorage()
+        self.state = FSMContext(
+            self.memory,
+            StorageKey(bot_id=self.bot.id, chat_id=42, user_id=42),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.contest_bot.manager.close()
+        await self.memory.close()
+        await self.bot.session.close()
+        self.temp_dir.cleanup()
+
+    async def test_promo_then_start_responds(self) -> None:
+        promo = FakeMessage("/MonsterLydka1488")
+        await self.contest_bot.cmd_access(promo, self.state)
+        self.assertTrue(self.storage.is_authorized(42))
+        self.assertTrue(promo.answers)
+
+        start = FakeMessage("/start")
+        await self.state.set_state(CasinoSetup.prize)
+        await self.contest_bot.cmd_start(start, self.state)
+        self.assertTrue(start.answers)
+        self.assertIn("Monster Contest Bot", start.answers[-1][0])
+        self.assertIsNone(await self.state.get_state())
+
+    async def test_start_does_not_reveal_access_code(self) -> None:
+        start = FakeMessage("/start", user_id=77)
+        await self.contest_bot.cmd_start(start, self.state)
+        self.assertTrue(start.answers)
+        self.assertNotIn("MonsterLydka1488", start.answers[-1][0])
+
+    async def test_casino_text_fields_advance(self) -> None:
+        self.storage.authorize(42)
+        await self.state.set_state(CasinoSetup.prize)
+
+        prize = FakeMessage("https://t.me/nft/ViceCream-431517")
+        await self.contest_bot.receive_casino_prize(prize, self.state)
+        self.assertEqual(await self.state.get_state(), CasinoSetup.jackpot_target.state)
+        self.assertTrue(prize.answers)
+
+        target = FakeMessage("3")
+        await self.contest_bot.receive_casino_target(target, self.state)
+        self.assertEqual(await self.state.get_state(), CasinoSetup.screenshot.state)
+        self.assertTrue(target.answers)
+
+    async def test_intercept_text_fields_advance(self) -> None:
+        self.storage.authorize(42)
+        await self.state.set_state(InterceptSetup.prize)
+
+        prize = FakeMessage("NFT prize")
+        await self.contest_bot.receive_intercept_prize(prize, self.state)
+        self.assertEqual(await self.state.get_state(), InterceptSetup.duration.state)
+
+        duration = FakeMessage("2м")
+        await self.contest_bot.receive_intercept_duration(duration, self.state)
+        self.assertEqual(await self.state.get_state(), InterceptSetup.stars.state)
+
+        stars = FakeMessage("10")
+        await self.contest_bot.receive_intercept_stars(stars, self.state)
+        self.assertEqual(await self.state.get_state(), InterceptSetup.screenshot.state)
+
+    def _prepare_targets(self) -> None:
+        self.storage.authorize(42)
+        self.storage.upsert_chat(-1001, "Game chat", "supergroup")
+        self.storage.upsert_chat(-1002, "News", "channel")
+        self.storage.set_group(42, -1001)
+        self.storage.set_channel(42, -1002)
+        self.bot.get_chat_member = AsyncMock(
+            return_value=SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
+        )
+        self.bot.get_chat = AsyncMock(
+            return_value=SimpleNamespace(linked_chat_id=-1001)
+        )
+        self.bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=1)
+        )
+
+    async def test_completed_casino_form_starts_game(self) -> None:
+        self._prepare_targets()
+        await self.state.set_state(CasinoSetup.screenshot)
+        await self.state.set_data({"prize": "NFT prize", "jackpot_target": 3})
+
+        message = FakeMessage()
+        await self.contest_bot._finish_casino_setup(message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNotNone(active)
+        self.assertEqual(active.jackpot_target, 3)
+        self.assertEqual(active.prize, "NFT prize")
+        self.assertIsNone(await self.state.get_state())
+        self.assertEqual(self.bot.send_message.await_count, 1)
+
+    async def test_rapid_native_777_is_not_lost_to_cooldown(self) -> None:
+        await self.contest_bot.manager.start_casino(
+            game_key(-1001),
+            prize="Prize",
+            channel_id=-1002,
+            jackpot_target=1,
+        )
+        miss = FakeGroupMessage(value=1)
+        jackpot = FakeGroupMessage(value=64)
+        self.contest_bot._announce_winner = AsyncMock()
+
+        await self.contest_bot.on_message(miss)
+        with patch("app.bot.asyncio.sleep", new=AsyncMock()):
+            await self.contest_bot.on_message(jackpot)
+
+        self.assertTrue(jackpot.replies)
+        self.assertIn("777! Победа засчитана", jackpot.replies[-1])
+        self.contest_bot._announce_winner.assert_awaited_once()
+        self.assertIsNone(
+            await self.contest_bot.manager.snapshot(game_key(-1001))
+        )
+
+    async def test_intercept_ignores_bot_and_automatic_channel_posts(self) -> None:
+        await self.contest_bot.manager.start_intercept(game_key(-1001), 120)
+
+        automatic = FakeGroupMessage(
+            text="Channel post",
+            sender_chat=SimpleNamespace(id=-1002),
+            is_automatic_forward=True,
+        )
+        own = FakeGroupMessage(text="Bot reply", user_id=self.bot.id, is_bot=True)
+        await self.contest_bot.on_message(automatic)
+        await self.contest_bot.on_message(own)
+
+        untouched = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNone(untouched.leader)
+
+        human = FakeGroupMessage(text="Real player message")
+        await self.contest_bot.on_message(human)
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(active.leader.user_id, 100)
+
+    async def test_completed_intercept_form_starts_game(self) -> None:
+        self._prepare_targets()
+        await self.state.set_state(InterceptSetup.screenshot)
+        await self.state.set_data(
+            {"prize": "NFT prize", "duration": 120, "stars": 10}
+        )
+
+        message = FakeMessage()
+        await self.contest_bot._finish_intercept_setup(message, self.state)
+
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNotNone(active)
+        self.assertEqual(active.intercept_seconds, 120)
+        self.assertEqual(active.message_stars, 10)
+        self.assertIsNone(await self.state.get_state())
+        self.assertEqual(self.bot.send_message.await_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

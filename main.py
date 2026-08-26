@@ -1,13 +1,13 @@
-"""Простой запуск Monster Contest Bot через Python.
+"""Единственный файл запуска Monster Contest Bot.
 
-Команда для Windows: py START_BOT.py
+Windows: py main.py
 Также файл можно открыть двойным щелчком.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import getpass
+import importlib.metadata
 import os
 import re
 import subprocess
@@ -18,12 +18,13 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_DIR / ".venv"
-TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 VENV_PYTHON = (
     VENV_DIR / "Scripts" / "python.exe"
     if os.name == "nt"
     else VENV_DIR / "bin" / "python"
 )
+AIROGRAM_VERSION = "3.30.0"
+TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 
 
 def wait_before_close() -> None:
@@ -33,43 +34,44 @@ def wait_before_close() -> None:
         pass
 
 
-def ensure_env_file() -> None:
-    """Create .env interactively on the first launch."""
+def ensure_settings() -> None:
+    """Запросить токен и создать локальные настройки при первом запуске."""
     env_path = PROJECT_DIR / ".env"
     if env_path.is_file():
         return
 
-    print("[0/3] Первая настройка бота.")
-    print("Новый токен можно получить у @BotFather командой /newbot или /token.")
+    print("[1/4] Первая настройка бота")
+    print("Получите новый токен у @BotFather и вставьте его ниже.")
     for _ in range(3):
-        token = getpass.getpass("Вставьте токен Telegram-бота: ").strip()
+        token = getpass.getpass("Токен Telegram-бота: ").strip()
         if TOKEN_RE.fullmatch(token):
             break
-        print("Токен выглядит неверно. Скопируйте его целиком из @BotFather.")
+        print("Токен выглядит неверно. Скопируйте его из @BotFather целиком.")
     else:
-        raise RuntimeError("Не удалось получить корректный BOT_TOKEN")
+        raise RuntimeError("Не удалось получить корректный токен")
 
     env_path.write_text(
         "BOT_TOKEN=" + token + "\n"
         "OWNER_IDS=\n"
-        "ACCESS_CODE=MonsterLydka1488\n"
-        "DATABASE_PATH=data/bot.sqlite3\n",
+        "ACCESS_CODE=/MonsterLydka1488\n"
+        "DATA_FILE=monster_bot.sqlite3\n"
+        "INTERCEPT_SECONDS=120\n"
+        "CASINO_COOLDOWN_SECONDS=3\n"
+        "PRIZE_CALL=@Monster_Tags, выдай приз победителю!\n",
         encoding="utf-8",
     )
-    print("Настройки сохранены в локальный файл .env. Не публикуйте этот файл.\n")
+    print("Настройки сохранены локально. Файл .env нельзя публиковать.\n")
 
 
 def create_virtual_environment() -> None:
     if VENV_PYTHON.exists():
         return
-    print("[1/3] Создаю окружение Python...")
+    print("[2/4] Создаю виртуальное окружение...")
     subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
 
 
 def relaunch_inside_environment() -> int:
-    current_python = Path(sys.executable).resolve()
-    target_python = VENV_PYTHON.resolve()
-    if current_python == target_python:
+    if Path(sys.executable).resolve() == VENV_PYTHON.resolve():
         return -1
     return subprocess.call(
         [str(VENV_PYTHON), str(Path(__file__).resolve())],
@@ -78,10 +80,14 @@ def relaunch_inside_environment() -> int:
 
 
 def install_dependencies() -> None:
-    missing = ["aiogram"] if importlib.util.find_spec("aiogram") is None else []
-    if not missing:
+    try:
+        installed_version = importlib.metadata.version("aiogram")
+    except importlib.metadata.PackageNotFoundError:
+        installed_version = None
+    if installed_version == AIROGRAM_VERSION:
         return
-    print("[2/3] Устанавливаю библиотеки. Это требуется только при первом запуске...")
+
+    print("[3/4] Устанавливаю aiogram. Это требуется только при первом запуске...")
     subprocess.check_call(
         [
             sys.executable,
@@ -89,8 +95,7 @@ def install_dependencies() -> None:
             "pip",
             "install",
             "--disable-pip-version-check",
-            "-r",
-            str(PROJECT_DIR / "requirements.txt"),
+            f"aiogram=={AIROGRAM_VERSION}",
         ],
         cwd=PROJECT_DIR,
     )
@@ -100,15 +105,15 @@ def main() -> int:
     os.chdir(PROJECT_DIR)
     if sys.version_info < (3, 11):
         raise RuntimeError("Нужен Python 3.11 или новее")
-    ensure_env_file()
 
+    ensure_settings()
     create_virtual_environment()
     child_exit_code = relaunch_inside_environment()
     if child_exit_code >= 0:
         return child_exit_code
 
     install_dependencies()
-    print("[3/3] Запускаю Monster Contest Bot...")
+    print("[4/4] Запускаю Monster Contest Bot...")
     print("Чтобы остановить бота, нажмите Ctrl+C.\n")
 
     from app.bot import run
