@@ -140,14 +140,9 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
     def _prepare_targets(self) -> None:
         self.storage.authorize(42)
         self.storage.upsert_chat(-1001, "Game chat", "supergroup")
-        self.storage.upsert_chat(-1002, "News", "channel")
         self.storage.set_group(42, -1001)
-        self.storage.set_channel(42, -1002)
         self.bot.get_chat_member = AsyncMock(
             return_value=SimpleNamespace(status=ChatMemberStatus.ADMINISTRATOR)
-        )
-        self.bot.get_chat = AsyncMock(
-            return_value=SimpleNamespace(linked_chat_id=-1001)
         )
         self.bot.send_message = AsyncMock(
             return_value=SimpleNamespace(message_id=1)
@@ -167,13 +162,12 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.prize, "NFT prize")
         self.assertEqual(active.tracking_after_message_id, 1)
         self.assertIsNone(await self.state.get_state())
-        self.assertEqual(self.bot.send_message.await_count, 2)
+        self.assertEqual(self.bot.send_message.await_count, 1)
 
     async def test_rapid_native_777_is_not_lost_to_cooldown(self) -> None:
         await self.contest_bot.manager.start_casino(
             game_key(-1001),
             prize="Prize",
-            channel_id=-1002,
             jackpot_target=1,
         )
         miss = FakeGroupMessage(value=1)
@@ -191,11 +185,11 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.contest_bot.manager.snapshot(game_key(-1001))
         )
 
-    async def test_intercept_ignores_bot_and_automatic_channel_posts(self) -> None:
+    async def test_intercept_ignores_bot_and_automatic_forwarded_posts(self) -> None:
         await self.contest_bot.manager.start_intercept(game_key(-1001), 120)
 
         automatic = FakeGroupMessage(
-            text="Channel post",
+            text="Forwarded post",
             sender_chat=SimpleNamespace(id=-1002),
             is_automatic_forward=True,
         )
@@ -244,7 +238,7 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.message_stars, 10)
         self.assertEqual(active.tracking_after_message_id, 1)
         self.assertIsNone(await self.state.get_state())
-        self.assertEqual(self.bot.send_message.await_count, 2)
+        self.assertEqual(self.bot.send_message.await_count, 1)
 
 
 if __name__ == "__main__":
