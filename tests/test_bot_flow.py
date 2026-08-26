@@ -48,7 +48,6 @@ class FakeGroupMessage:
         is_automatic_forward: bool = False,
         text: str | None = None,
         message_id: int = 10,
-        paid_star_count: int | None = None,
     ) -> None:
         self.chat = SimpleNamespace(
             id=-1001,
@@ -66,7 +65,6 @@ class FakeGroupMessage:
         self.is_automatic_forward = is_automatic_forward
         self.text = text
         self.message_id = message_id
-        self.paid_star_count = paid_star_count
         self.dice = (
             SimpleNamespace(emoji="🎰", value=value) if value is not None else None
         )
@@ -249,7 +247,7 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.state.get_state())
         self.assertEqual(self.bot.send_message.await_count, 1)
 
-    async def test_guess_form_and_paid_answer(self) -> None:
+    async def test_guess_form_and_display_price_only(self) -> None:
         self._prepare_targets()
         await self.state.set_state(GuessSetup.stars)
         await self.state.set_data(
@@ -266,30 +264,25 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.contest_bot._announce_winner = AsyncMock()
 
-        unpaid = FakeGroupMessage(text="42", message_id=20, paid_star_count=9)
-        paid = FakeGroupMessage(text="42", message_id=21, paid_star_count=10)
-        await self.contest_bot.on_message(unpaid)
-        self.assertIsNotNone(await self.contest_bot.manager.snapshot(game_key(-1001)))
-        await self.contest_bot.on_message(paid)
+        ordinary = FakeGroupMessage(text="42", message_id=20)
+        await self.contest_bot.on_message(ordinary)
 
-        self.assertTrue(paid.replies)
+        self.assertTrue(ordinary.replies)
         self.contest_bot._announce_winner.assert_awaited_once()
         self.assertIsNone(await self.contest_bot.manager.snapshot(game_key(-1001)))
 
-    async def test_race_counts_a_paid_user_only_once(self) -> None:
+    async def test_race_counts_an_ordinary_user_only_once(self) -> None:
         await self.contest_bot.manager.start_race(
             game_key(-1001), 60, message_stars=5
         )
-        unpaid = FakeGroupMessage(text="go", message_id=30, paid_star_count=4)
-        paid = FakeGroupMessage(text="go", message_id=31, paid_star_count=5)
-        duplicate = FakeGroupMessage(text="again", message_id=32, paid_star_count=5)
-        await self.contest_bot.on_message(unpaid)
-        await self.contest_bot.on_message(paid)
+        ordinary = FakeGroupMessage(text="go", message_id=31)
+        duplicate = FakeGroupMessage(text="again", message_id=32)
+        await self.contest_bot.on_message(ordinary)
         await self.contest_bot.on_message(duplicate)
 
         active = await self.contest_bot.manager.snapshot(game_key(-1001))
         self.assertEqual(len(active.participants), 1)
-        self.assertEqual(len(paid.replies), 1)
+        self.assertEqual(len(ordinary.replies), 1)
         self.assertEqual(duplicate.replies, [])
 
     async def test_case_is_saved_and_started(self) -> None:

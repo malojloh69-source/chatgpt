@@ -200,12 +200,6 @@ def format_chance(chance: float) -> str:
     return f"{chance:.6f}".rstrip("0").rstrip(".")
 
 
-def paid_message_is_valid(message: Message, required_stars: int) -> bool:
-    if required_stars <= 0:
-        return True
-    return int(getattr(message, "paid_star_count", 0) or 0) >= required_stars
-
-
 def select_drop(
     drops: tuple[DropOutcome, ...], roll_percent: float
 ) -> DropOutcome | None:
@@ -614,9 +608,7 @@ class ContestBot:
             "2. Через @BotFather отключите Privacy Mode, чтобы бот видел сообщения "
             "и слоты в группе.\n"
             "3. Отправьте в группе любое сообщение, чтобы она появилась в списке.\n"
-            "4. Для платных попыток включите платные сообщения в настройках "
-            "супергруппы и задайте ту же цену Stars, что в панели.\n"
-            "5. Откройте /contest, выберите группу, затем игру.\n\n"
+            "4. Откройте /contest, выберите группу, затем игру.\n\n"
             "<i>Все настройки выполняются только здесь, в личных сообщениях с ботом.</i>"
         )
 
@@ -724,24 +716,6 @@ class ContestBot:
         if not await self._is_bot_ready(targets.group_id):
             return "Назначьте бота администратором выбранной группы."
         return targets.group_id
-
-    async def _validate_paid_message_price(
-        self, group_id: int, stars: int
-    ) -> str | None:
-        if stars <= 0:
-            return None
-        try:
-            chat = await self.bot.get_chat(group_id)
-        except TelegramAPIError as exc:
-            return f"Не удалось проверить цену сообщений: {html.quote(str(exc))}"
-        configured = int(getattr(chat, "paid_message_star_count", 0) or 0)
-        if configured == stars:
-            return None
-        return (
-            "В настройках выбранной супергруппы включите платные сообщения и "
-            f"установите цену <b>{stars} ⭐️</b>. Сейчас Telegram сообщает цену "
-            f"<b>{configured} ⭐️</b>. После этого снова запустите игру."
-        )
 
     async def cb_casino_setup(
         self, callback: CallbackQuery, state: FSMContext
@@ -1152,11 +1126,6 @@ class ContestBot:
             return
         data = await state.get_data()
         stars = int(data["stars"])
-        paid_error = await self._validate_paid_message_price(group_id, stars)
-        if paid_error:
-            await message.answer(paid_error, reply_markup=home_keyboard())
-            await state.clear()
-            return
         prize = str(data["prize"])
         secret_number = int(data["secret_number"])
         try:
@@ -1293,11 +1262,6 @@ class ContestBot:
             return
         data = await state.get_data()
         stars = int(data["stars"])
-        paid_error = await self._validate_paid_message_price(group_id, stars)
-        if paid_error:
-            await message.answer(paid_error, reply_markup=home_keyboard())
-            await state.clear()
-            return
         prize = str(data["prize"])
         duration = int(data["duration"])
         try:
@@ -1669,10 +1633,6 @@ class ContestBot:
                 reply_markup=home_keyboard(),
             )
             return
-        paid_error = await self._validate_paid_message_price(group_id, saved_case.stars)
-        if paid_error:
-            await message.answer(paid_error, reply_markup=home_keyboard())
-            return
         try:
             group_post = await self._send_public(
                 group_id,
@@ -1858,8 +1818,6 @@ class ContestBot:
             return
 
         if state.kind is ContestType.GUESS:
-            if not paid_message_is_valid(message, state.message_stars):
-                return
             raw = (message.text or "").strip()
             if not raw.isdigit() or not 1 <= int(raw) <= 100:
                 return
@@ -1873,8 +1831,6 @@ class ContestBot:
             return
 
         if state.kind is ContestType.RACE:
-            if not paid_message_is_valid(message, state.message_stars):
-                return
             update = await self.manager.submit_race(key, participant)
             if update and update.accepted:
                 await message.reply(
@@ -1884,8 +1840,6 @@ class ContestBot:
             return
 
         if state.kind is ContestType.CASE:
-            if not paid_message_is_valid(message, state.message_stars):
-                return
             opened = await self.manager.open_case(key, message.message_id)
             if opened is None:
                 return
