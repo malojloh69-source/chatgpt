@@ -36,9 +36,18 @@ def wait_before_close() -> None:
 
 def ensure_settings() -> None:
     """Запросить токен и создать локальные настройки при первом запуске."""
+    if os.getenv("BOT_TOKEN", "").strip():
+        print("[1/4] Токен получен из переменных окружения хостинга.")
+        return
+
     env_path = PROJECT_DIR / ".env"
     if env_path.is_file():
         return
+
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Для запуска на хостинге добавьте секрет BOT_TOKEN в Environment Variables"
+        )
 
     print("[1/4] Первая настройка бота")
     print("Получите новый токен у @BotFather и вставьте его ниже.")
@@ -106,11 +115,13 @@ def main() -> int:
     if sys.version_info < (3, 11):
         raise RuntimeError("Нужен Python 3.11 или новее")
 
+    hosted = bool(os.getenv("BOT_TOKEN", "").strip())
     ensure_settings()
-    create_virtual_environment()
-    child_exit_code = relaunch_inside_environment()
-    if child_exit_code >= 0:
-        return child_exit_code
+    if not hosted:
+        create_virtual_environment()
+        child_exit_code = relaunch_inside_environment()
+        if child_exit_code >= 0:
+            return child_exit_code
 
     install_dependencies()
     print("[4/4] Запускаю Monster Contest Bot...")
