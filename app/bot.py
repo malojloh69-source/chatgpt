@@ -654,10 +654,17 @@ class ContestBot:
                 data.get("screenshot_kind"),
                 data.get("screenshot_file_id"),
             )
+            group_post = await self._send_public(
+                group_id,
+                self._group_tracking_text(text),
+                data.get("screenshot_kind"),
+                data.get("screenshot_file_id"),
+            )
         except TelegramAPIError as exc:
-            logger.exception("Could not publish casino announcement")
+            logger.exception("Could not publish casino announcements")
             await message.answer(
-                f"Не удалось опубликовать пост в канале: <code>{html.quote(str(exc))}</code>"
+                "Не удалось опубликовать стартовые сообщения в канале и группе: "
+                f"<code>{html.quote(str(exc))}</code>"
             )
             return
         await self.manager.start_casino(
@@ -665,11 +672,12 @@ class ContestBot:
             prize=prize,
             channel_id=channel_id,
             jackpot_target=target,
+            tracking_after_message_id=group_post.message_id,
         )
         await state.clear()
         await message.answer(
-            "✅ <b>Казино запущено.</b> Пост опубликован в канале, бот следит "
-            "за слотами 🎰 в выбранном чате.",
+            "✅ <b>Казино запущено.</b> Стартовые сообщения опубликованы в канале "
+            "и группе. Бот учитывает слоты 🎰, отправленные после своего сообщения.",
             reply_markup=home_keyboard(),
         )
 
@@ -804,10 +812,17 @@ class ContestBot:
                 data.get("screenshot_kind"),
                 data.get("screenshot_file_id"),
             )
+            group_post = await self._send_public(
+                group_id,
+                self._group_tracking_text(text),
+                data.get("screenshot_kind"),
+                data.get("screenshot_file_id"),
+            )
         except TelegramAPIError as exc:
-            logger.exception("Could not publish intercept announcement")
+            logger.exception("Could not publish intercept announcements")
             await message.answer(
-                f"Не удалось опубликовать пост в канале: <code>{html.quote(str(exc))}</code>"
+                "Не удалось опубликовать стартовые сообщения в канале и группе: "
+                f"<code>{html.quote(str(exc))}</code>"
             )
             return
         await self.manager.start_intercept(
@@ -816,11 +831,12 @@ class ContestBot:
             prize=prize,
             channel_id=channel_id,
             message_stars=stars,
+            tracking_after_message_id=group_post.message_id,
         )
         await state.clear()
         await message.answer(
-            "✅ <b>«Перебив» запущен.</b> Пост опубликован в канале, бот следит "
-            "за сообщениями выбранного чата.",
+            "✅ <b>«Перебив» запущен.</b> Стартовые сообщения опубликованы в канале "
+            "и группе. Отслеживание началось после сообщения бота.",
             reply_markup=home_keyboard(),
         )
 
@@ -886,6 +902,11 @@ class ContestBot:
         key = game_key(message.chat.id)
         state = await self.manager.snapshot(key)
         if state is None:
+            return
+        if (
+            state.tracking_after_message_id is not None
+            and message.message_id <= state.tracking_after_message_id
+        ):
             return
         participant = participant_from(message.from_user)
 
@@ -988,6 +1009,13 @@ class ContestBot:
             f"{premium(CASINO_START_IDS[2], '🎰')} <b>Кол-во 🎰:</b> {target}\n"
             f"<b>Комбинация:</b> {seven}{seven}{seven}\n\n"
             "<i>Кидай слоты в комментариях, чтобы выиграть!</i>"
+        )
+
+    @staticmethod
+    def _group_tracking_text(text: str) -> str:
+        return (
+            f"{text}\n\n"
+            "<b>⬇️ Отслеживание участников начинается после этого сообщения.</b>"
         )
 
     def _intercept_start_text(self, prize: str, seconds: int, stars: int) -> str:
