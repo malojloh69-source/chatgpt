@@ -32,6 +32,7 @@ class ContestState:
     started_at: float
     prize: str = ""
     channel_id: int | None = None
+    tracking_after_message_id: int | None = None
     intercept_seconds: float | None = None
     message_stars: int = 0
     leader: Participant | None = None
@@ -101,6 +102,7 @@ class ContestManager:
         *,
         prize: str = "",
         channel_id: int | None = None,
+        tracking_after_message_id: int | None = None,
     ) -> ContestState:
         state = ContestState(
             game_id=self._next_game_id,
@@ -108,6 +110,7 @@ class ContestManager:
             started_at=self._clock(),
             prize=prize,
             channel_id=channel_id,
+            tracking_after_message_id=tracking_after_message_id,
         )
         self._next_game_id += 1
         return state
@@ -133,6 +136,7 @@ class ContestManager:
         prize: str = "",
         channel_id: int | None = None,
         message_stars: int = 0,
+        tracking_after_message_id: int | None = None,
     ) -> ContestState:
         if seconds <= 0:
             raise ValueError("seconds must be positive")
@@ -141,7 +145,10 @@ class ContestManager:
         async with self._lock:
             self._cancel_timer_locked(key)
             state = self._new_state(
-                ContestType.INTERCEPT, prize=prize, channel_id=channel_id
+                ContestType.INTERCEPT,
+                prize=prize,
+                channel_id=channel_id,
+                tracking_after_message_id=tracking_after_message_id,
             )
             state.intercept_seconds = seconds
             state.message_stars = message_stars
@@ -155,13 +162,17 @@ class ContestManager:
         prize: str = "",
         channel_id: int | None = None,
         jackpot_target: int = 1,
+        tracking_after_message_id: int | None = None,
     ) -> ContestState:
         if not 1 <= jackpot_target <= 100:
             raise ValueError("jackpot_target must be between 1 and 100")
         async with self._lock:
             self._cancel_timer_locked(key)
             state = self._new_state(
-                ContestType.CASINO, prize=prize, channel_id=channel_id
+                ContestType.CASINO,
+                prize=prize,
+                channel_id=channel_id,
+                tracking_after_message_id=tracking_after_message_id,
             )
             state.jackpot_target = jackpot_target
             self._states[key] = state
@@ -174,13 +185,17 @@ class ContestManager:
         *,
         prize: str = "",
         channel_id: int | None = None,
+        tracking_after_message_id: int | None = None,
     ) -> ContestState:
         if not 1 <= secret_number <= 100:
             raise ValueError("secret_number must be between 1 and 100")
         async with self._lock:
             self._cancel_timer_locked(key)
             state = self._new_state(
-                ContestType.GUESS, prize=prize, channel_id=channel_id
+                ContestType.GUESS,
+                prize=prize,
+                channel_id=channel_id,
+                tracking_after_message_id=tracking_after_message_id,
             )
             state.secret_number = secret_number
             self._states[key] = state
