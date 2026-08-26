@@ -1,0 +1,2 @@
+"""Monster Contest Bot package."""
+
