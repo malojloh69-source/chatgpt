@@ -16,6 +16,7 @@ class MainLauncherTests(unittest.TestCase):
             with (
                 patch.object(main, "PROJECT_DIR", project_dir),
                 patch("main.getpass.getpass", return_value=token),
+                patch("main.sys.stdin.isatty", return_value=True),
                 patch("builtins.print"),
             ):
                 main.ensure_settings()
@@ -37,6 +38,21 @@ class MainLauncherTests(unittest.TestCase):
 
             get_token.assert_not_called()
             self.assertEqual(env_path.read_text(encoding="utf-8"), "BOT_TOKEN=keep\n")
+
+    def test_hosting_token_does_not_require_env_file_or_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            token = "123456789:" + "A" * 35
+            with (
+                patch.object(main, "PROJECT_DIR", project_dir),
+                patch.dict(main.os.environ, {"BOT_TOKEN": token}, clear=True),
+                patch("main.getpass.getpass") as get_token,
+                patch("builtins.print"),
+            ):
+                main.ensure_settings()
+
+            get_token.assert_not_called()
+            self.assertFalse((project_dir / ".env").exists())
 
     def test_dependency_is_installed_without_requirements_file(self) -> None:
         with (
