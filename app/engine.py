@@ -31,7 +31,6 @@ class ContestState:
     kind: ContestType
     started_at: float
     prize: str = ""
-    channel_id: int | None = None
     tracking_after_message_id: int | None = None
     intercept_seconds: float | None = None
     message_stars: int = 0
@@ -79,7 +78,7 @@ class CasinoSpinUpdate:
 
 
 class ContestManager:
-    """Keeps one active contest per selected discussion group."""
+    """Keeps one active contest per selected group."""
 
     def __init__(
         self,
@@ -101,7 +100,6 @@ class ContestManager:
         kind: ContestType,
         *,
         prize: str = "",
-        channel_id: int | None = None,
         tracking_after_message_id: int | None = None,
     ) -> ContestState:
         state = ContestState(
@@ -109,7 +107,6 @@ class ContestManager:
             kind=kind,
             started_at=self._clock(),
             prize=prize,
-            channel_id=channel_id,
             tracking_after_message_id=tracking_after_message_id,
         )
         self._next_game_id += 1
@@ -134,7 +131,6 @@ class ContestManager:
         seconds: float,
         *,
         prize: str = "",
-        channel_id: int | None = None,
         message_stars: int = 0,
         tracking_after_message_id: int | None = None,
     ) -> ContestState:
@@ -147,7 +143,6 @@ class ContestManager:
             state = self._new_state(
                 ContestType.INTERCEPT,
                 prize=prize,
-                channel_id=channel_id,
                 tracking_after_message_id=tracking_after_message_id,
             )
             state.intercept_seconds = seconds
@@ -160,7 +155,6 @@ class ContestManager:
         key: ContestKey,
         *,
         prize: str = "",
-        channel_id: int | None = None,
         jackpot_target: int = 1,
         tracking_after_message_id: int | None = None,
     ) -> ContestState:
@@ -171,7 +165,6 @@ class ContestManager:
             state = self._new_state(
                 ContestType.CASINO,
                 prize=prize,
-                channel_id=channel_id,
                 tracking_after_message_id=tracking_after_message_id,
             )
             state.jackpot_target = jackpot_target
@@ -184,7 +177,6 @@ class ContestManager:
         secret_number: int,
         *,
         prize: str = "",
-        channel_id: int | None = None,
         tracking_after_message_id: int | None = None,
     ) -> ContestState:
         if not 1 <= secret_number <= 100:
@@ -194,7 +186,6 @@ class ContestManager:
             state = self._new_state(
                 ContestType.GUESS,
                 prize=prize,
-                channel_id=channel_id,
                 tracking_after_message_id=tracking_after_message_id,
             )
             state.secret_number = secret_number
