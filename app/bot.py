@@ -185,11 +185,8 @@ def panel_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💬 Выбрать чат", callback_data="panel:group"
-                ),
-                InlineKeyboardButton(
-                    text="📣 Выбрать канал", callback_data="panel:channel"
-                ),
+                    text="💬 Выбрать группу", callback_data="panel:group"
+                )
             ],
             [
                 InlineKeyboardButton(text="🎰 777", callback_data="game:casino"),
@@ -206,7 +203,7 @@ def panel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def choices_keyboard(chats: list[KnownChat], target: str) -> InlineKeyboardMarkup:
+def choices_keyboard(chats: list[KnownChat]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for chat in chats:
         title = chat.title if len(chat.title) <= 36 else f"{chat.title[:33]}…"
@@ -214,7 +211,7 @@ def choices_keyboard(chats: list[KnownChat], target: str) -> InlineKeyboardMarku
             [
                 InlineKeyboardButton(
                     text=title,
-                    callback_data=f"pick:{target}:{chat.chat_id}",
+                    callback_data=f"pick:{chat.chat_id}",
                 )
             ]
         )
@@ -233,7 +230,6 @@ class ContestBot:
 
     def _register_handlers(self) -> None:
         self.router.my_chat_member.register(self.on_my_chat_member)
-        self.router.channel_post.register(self.on_channel_post)
 
         self.router.message.register(
             self.cmd_access,
@@ -249,10 +245,7 @@ class ContestBot:
             self.cb_choose_group, F.data == "panel:group"
         )
         self.router.callback_query.register(
-            self.cb_choose_channel, F.data == "panel:channel"
-        )
-        self.router.callback_query.register(
-            self.cb_pick_target, F.data.startswith("pick:")
+            self.cb_pick_group, F.data.startswith("pick:")
         )
         self.router.callback_query.register(
             self.cb_casino_setup, F.data == "game:casino"
@@ -297,7 +290,7 @@ class ContestBot:
         self.router.message.register(self.on_message)
 
     async def _remember_chat(self, chat) -> None:
-        if chat.type not in {*GROUP_TYPES, ChatType.CHANNEL}:
+        if chat.type not in GROUP_TYPES:
             return
         kind = chat.type.value if hasattr(chat.type, "value") else str(chat.type)
         self.storage.upsert_chat(
@@ -311,9 +304,6 @@ class ContestBot:
         if update.new_chat_member.status in ACTIVE_MEMBER_STATUSES:
             await self._remember_chat(update.chat)
 
-    async def on_channel_post(self, message: Message) -> None:
-        await self._remember_chat(message.chat)
-
     async def _is_user_admin(self, chat_id: int, user_id: int) -> bool:
         try:
             member = await self.bot.get_chat_member(chat_id, user_id)
@@ -321,14 +311,13 @@ class ContestBot:
             return False
         return member.status in ADMIN_STATUSES
 
-    async def _is_bot_ready(self, chat_id: int, *, channel: bool) -> bool:
+    async def _is_bot_ready(self, chat_id: int) -> bool:
         try:
             member = await self.bot.get_chat_member(chat_id, self.bot.id)
         except TelegramAPIError:
             return False
-        # Administrator status is required in both places. In the discussion
-        # group this guarantees that Telegram delivers ordinary messages and
-        # native dice even when BotFather Privacy Mode is still enabled.
+        # Administrator status guarantees that Telegram delivers ordinary
+        # messages and native dice even when Privacy Mode is still enabled.
         return member.status in ADMIN_STATUSES
 
     async def _require_access_message(self, message: Message) -> bool:
@@ -366,7 +355,7 @@ class ContestBot:
         if message.from_user and self.storage.is_authorized(message.from_user.id):
             await message.answer(
                 "🎁 <b>Monster Contest Bot</b>\n\n"
-                "Выберите группу и канал, затем настройте игру.",
+                "Выберите группу, затем настройте игру.",
                 reply_markup=home_keyboard(),
             )
             return
@@ -380,13 +369,11 @@ class ContestBot:
             return
         await message.answer(
             "<b>Как запустить игру</b>\n\n"
-            "1. Добавьте бота в группу и канал.\n"
-            "2. В канале дайте боту право публиковать сообщения.\n"
-            "3. Через @BotFather отключите Privacy Mode, чтобы бот видел сообщения "
+            "1. Добавьте бота в группу и назначьте администратором.\n"
+            "2. Через @BotFather отключите Privacy Mode, чтобы бот видел сообщения "
             "и слоты в группе.\n"
-            "4. Если нужны комментарии под постом, свяжите канал с этой группой "
-            "в настройках Telegram.\n"
-            "5. Откройте /contest, выберите чат и канал, затем игру.\n\n"
+            "3. Отправьте в группе любое сообщение, чтобы она появилась в списке.\n"
+            "4. Откройте /contest, выберите группу, затем игру.\n\n"
             "<i>Все настройки выполняются только здесь, в личных сообщениях с ботом.</i>"
         )
 
@@ -399,13 +386,10 @@ class ContestBot:
     def _panel_text(self, user_id: int) -> str:
         targets = self.storage.get_targets(user_id)
         group = self.storage.get_chat(targets.group_id)
-        channel = self.storage.get_chat(targets.channel_id)
         group_name = html.quote(group.title) if group else "<i>не выбран</i>"
-        channel_name = html.quote(channel.title) if channel else "<i>не выбран</i>"
         return (
             "🎛 <b>Панель управления</b>\n\n"
-            f"💬 <b>Чат игры:</b> {group_name}\n"
-            f"📣 <b>Канал постов:</b> {channel_name}\n\n"
+            f"💬 <b>Группа игры:</b> {group_name}\n\n"
             "Выберите игру и заполните настройки."
         )
 
@@ -443,43 +427,23 @@ class ContestBot:
             callback.from_user.id, (ChatType.GROUP.value, ChatType.SUPERGROUP.value)
         )
         await callback.answer()
-        text = "💬 <b>Выберите чат игры:</b>"
+        text = "💬 <b>Выберите группу для игры:</b>"
         if not chats:
             text += (
                 "\n\nСписок пуст. Добавьте бота в группу, сделайте себя "
                 "администратором и отправьте там любое сообщение, затем обновите панель."
             )
         await callback.message.edit_text(
-            text, reply_markup=choices_keyboard(chats, "g")
+            text, reply_markup=choices_keyboard(chats)
         )
 
-    async def cb_choose_channel(self, callback: CallbackQuery) -> None:
-        if not await self._require_access_callback(callback):
-            return
-        if not isinstance(callback.message, Message):
-            await callback.answer("Сообщение недоступно", show_alert=True)
-            return
-        chats = await self._available_chats(
-            callback.from_user.id, (ChatType.CHANNEL.value,)
-        )
-        await callback.answer()
-        text = "📣 <b>Выберите канал для публикаций:</b>"
-        if not chats:
-            text += (
-                "\n\nСписок пуст. Добавьте бота в канал администратором с правом "
-                "публикации, затем обновите панель."
-            )
-        await callback.message.edit_text(
-            text, reply_markup=choices_keyboard(chats, "c")
-        )
-
-    async def cb_pick_target(self, callback: CallbackQuery) -> None:
+    async def cb_pick_group(self, callback: CallbackQuery) -> None:
         if not await self._require_access_callback(callback):
             return
         if not callback.data or not isinstance(callback.message, Message):
             return
         try:
-            _, target, raw_chat_id = callback.data.split(":", 2)
+            _, raw_chat_id = callback.data.split(":", 1)
             chat_id = int(raw_chat_id)
         except (ValueError, TypeError):
             await callback.answer("Некорректный выбор", show_alert=True)
@@ -488,52 +452,24 @@ class ContestBot:
         if chat is None or not await self._is_user_admin(chat_id, callback.from_user.id):
             await callback.answer("Вы больше не администратор этого чата", show_alert=True)
             return
-        if target == "g":
-            if chat.kind not in {ChatType.GROUP.value, ChatType.SUPERGROUP.value}:
-                await callback.answer("Это не групповой чат", show_alert=True)
-                return
-            self.storage.set_group(callback.from_user.id, chat_id)
-        elif target == "c":
-            if chat.kind != ChatType.CHANNEL.value:
-                await callback.answer("Это не канал", show_alert=True)
-                return
-            self.storage.set_channel(callback.from_user.id, chat_id)
-        else:
-            await callback.answer("Некорректный выбор", show_alert=True)
+        if chat.kind not in {ChatType.GROUP.value, ChatType.SUPERGROUP.value}:
+            await callback.answer("Это не группа", show_alert=True)
             return
+        self.storage.set_group(callback.from_user.id, chat_id)
         await callback.answer("Сохранено")
         await callback.message.edit_text(
             self._panel_text(callback.from_user.id), reply_markup=panel_keyboard()
         )
 
-    async def _validate_targets(self, user_id: int) -> tuple[int, int] | str:
+    async def _validate_targets(self, user_id: int) -> int | str:
         targets = self.storage.get_targets(user_id)
-        if targets.group_id is None or targets.channel_id is None:
-            return "Сначала выберите чат игры и канал для публикаций."
+        if targets.group_id is None:
+            return "Сначала выберите группу для игры."
         if not await self._is_user_admin(targets.group_id, user_id):
-            return "Вы должны быть администратором выбранного чата."
-        if not await self._is_user_admin(targets.channel_id, user_id):
-            return "Вы должны быть администратором выбранного канала."
-        if not await self._is_bot_ready(targets.group_id, channel=False):
-            return "Назначьте бота администратором выбранного чата."
-        if not await self._is_bot_ready(targets.channel_id, channel=True):
-            return "Назначьте бота администратором канала с правом публикации."
-        try:
-            channel = await self.bot.get_chat(targets.channel_id)
-        except TelegramAPIError:
-            return "Не удалось проверить группу обсуждений выбранного канала."
-        linked_chat_id = getattr(channel, "linked_chat_id", None)
-        if linked_chat_id is None:
-            return (
-                "Подключите к выбранному каналу группу обсуждений. "
-                "Иначе бот не увидит слоты под постом."
-            )
-        if linked_chat_id != targets.group_id:
-            return (
-                "Выбранный чат не является группой обсуждений выбранного канала. "
-                "Выберите привязанную группу."
-            )
-        return targets.group_id, targets.channel_id
+            return "Вы должны быть администратором выбранной группы."
+        if not await self._is_bot_ready(targets.group_id):
+            return "Назначьте бота администратором выбранной группы."
+        return targets.group_id
 
     async def cb_casino_setup(
         self, callback: CallbackQuery, state: FSMContext
@@ -635,7 +571,7 @@ class ContestBot:
             await message.answer(targets, reply_markup=home_keyboard())
             await state.clear()
             return
-        group_id, channel_id = targets
+        group_id = targets
         if await self.manager.snapshot(game_key(group_id)) is not None:
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
@@ -648,36 +584,29 @@ class ContestBot:
         target = int(data["jackpot_target"])
         text = self._casino_start_text(prize, target)
         try:
-            await self._send_public(
-                channel_id,
-                text,
-                data.get("screenshot_kind"),
-                data.get("screenshot_file_id"),
-            )
             group_post = await self._send_public(
                 group_id,
-                self._group_tracking_text(text),
+                self._tracking_text(text),
                 data.get("screenshot_kind"),
                 data.get("screenshot_file_id"),
             )
         except TelegramAPIError as exc:
             logger.exception("Could not publish casino announcements")
             await message.answer(
-                "Не удалось опубликовать стартовые сообщения в канале и группе: "
+                "Не удалось опубликовать стартовое сообщение в группе: "
                 f"<code>{html.quote(str(exc))}</code>"
             )
             return
         await self.manager.start_casino(
             game_key(group_id),
             prize=prize,
-            channel_id=channel_id,
             jackpot_target=target,
             tracking_after_message_id=group_post.message_id,
         )
         await state.clear()
         await message.answer(
-            "✅ <b>Казино запущено.</b> Стартовые сообщения опубликованы в канале "
-            "и группе. Бот учитывает слоты 🎰, отправленные после своего сообщения.",
+            "✅ <b>Казино запущено.</b> Стартовое сообщение опубликовано в группе. "
+            "Бот учитывает слоты 🎰, отправленные после своего сообщения.",
             reply_markup=home_keyboard(),
         )
 
@@ -792,7 +721,7 @@ class ContestBot:
             await message.answer(targets, reply_markup=home_keyboard())
             await state.clear()
             return
-        group_id, channel_id = targets
+        group_id = targets
         if await self.manager.snapshot(game_key(group_id)) is not None:
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
@@ -806,22 +735,16 @@ class ContestBot:
         stars = int(data["stars"])
         text = self._intercept_start_text(prize, duration, stars)
         try:
-            await self._send_public(
-                channel_id,
-                text,
-                data.get("screenshot_kind"),
-                data.get("screenshot_file_id"),
-            )
             group_post = await self._send_public(
                 group_id,
-                self._group_tracking_text(text),
+                self._tracking_text(text),
                 data.get("screenshot_kind"),
                 data.get("screenshot_file_id"),
             )
         except TelegramAPIError as exc:
             logger.exception("Could not publish intercept announcements")
             await message.answer(
-                "Не удалось опубликовать стартовые сообщения в канале и группе: "
+                "Не удалось опубликовать стартовое сообщение в группе: "
                 f"<code>{html.quote(str(exc))}</code>"
             )
             return
@@ -829,14 +752,13 @@ class ContestBot:
             game_key(group_id),
             duration,
             prize=prize,
-            channel_id=channel_id,
             message_stars=stars,
             tracking_after_message_id=group_post.message_id,
         )
         await state.clear()
         await message.answer(
-            "✅ <b>«Перебив» запущен.</b> Стартовые сообщения опубликованы в канале "
-            "и группе. Отслеживание началось после сообщения бота.",
+            "✅ <b>«Перебив» запущен.</b> Стартовое сообщение опубликовано в группе. "
+            "Отслеживание началось после сообщения бота.",
             reply_markup=home_keyboard(),
         )
 
@@ -976,7 +898,7 @@ class ContestBot:
 
     async def _send_public(
         self,
-        channel_id: int,
+        chat_id: int,
         text: str,
         screenshot_kind: object = None,
         screenshot_file_id: object = None,
@@ -984,13 +906,13 @@ class ContestBot:
         async def send(value: str) -> Message:
             if screenshot_kind == "photo" and isinstance(screenshot_file_id, str):
                 return await self.bot.send_photo(
-                    channel_id, screenshot_file_id, caption=value
+                    chat_id, screenshot_file_id, caption=value
                 )
             if screenshot_kind == "document" and isinstance(screenshot_file_id, str):
                 return await self.bot.send_document(
-                    channel_id, screenshot_file_id, caption=value
+                    chat_id, screenshot_file_id, caption=value
                 )
-            return await self.bot.send_message(channel_id, value)
+            return await self.bot.send_message(chat_id, value)
 
         try:
             return await send(text)
@@ -1008,11 +930,11 @@ class ContestBot:
             "<b>Тип:</b> <i>🎰 Слоты</i>\n"
             f"{premium(CASINO_START_IDS[2], '🎰')} <b>Кол-во 🎰:</b> {target}\n"
             f"<b>Комбинация:</b> {seven}{seven}{seven}\n\n"
-            "<i>Кидай слоты в комментариях, чтобы выиграть!</i>"
+            "<i>Кидай слоты в этой группе, чтобы выиграть!</i>"
         )
 
     @staticmethod
-    def _group_tracking_text(text: str) -> str:
+    def _tracking_text(text: str) -> str:
         return (
             f"{text}\n\n"
             "<b>⬇️ Отслеживание участников начинается после этого сообщения.</b>"
@@ -1056,13 +978,10 @@ class ContestBot:
         self, key: ContestKey, winner: Participant, state: ContestState
     ) -> None:
         text = self._winner_text(winner, state)
-        destination = state.channel_id or key[0]
         try:
-            await self._send_public(destination, text)
+            await self._send_public(key[0], text)
         except TelegramAPIError:
-            logger.exception("Could not announce winner in channel")
-            if destination != key[0]:
-                await self._send_public(key[0], text)
+            logger.exception("Could not announce winner in group")
 
     def _status_text(self, state: ContestState | None) -> str:
         if state is None:
