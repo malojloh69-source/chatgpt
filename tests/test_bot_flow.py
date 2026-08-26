@@ -40,6 +40,7 @@ class FakeGroupMessage:
         sender_chat=None,
         is_automatic_forward: bool = False,
         text: str | None = None,
+        message_id: int = 10,
     ) -> None:
         self.chat = SimpleNamespace(
             id=-1001,
@@ -56,6 +57,7 @@ class FakeGroupMessage:
         self.sender_chat = sender_chat
         self.is_automatic_forward = is_automatic_forward
         self.text = text
+        self.message_id = message_id
         self.dice = (
             SimpleNamespace(emoji="🎰", value=value) if value is not None else None
         )
@@ -163,8 +165,9 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(active)
         self.assertEqual(active.jackpot_target, 3)
         self.assertEqual(active.prize, "NFT prize")
+        self.assertEqual(active.tracking_after_message_id, 1)
         self.assertIsNone(await self.state.get_state())
-        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertEqual(self.bot.send_message.await_count, 2)
 
     async def test_rapid_native_777_is_not_lost_to_cooldown(self) -> None:
         await self.contest_bot.manager.start_casino(
@@ -208,6 +211,23 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         active = await self.contest_bot.manager.snapshot(game_key(-1001))
         self.assertEqual(active.leader.user_id, 100)
 
+    async def test_tracking_starts_only_after_bots_group_message(self) -> None:
+        await self.contest_bot.manager.start_intercept(
+            game_key(-1001), 120, tracking_after_message_id=50
+        )
+
+        old_message = FakeGroupMessage(text="Too early", message_id=49)
+        boundary_message = FakeGroupMessage(text="Boundary", message_id=50)
+        new_message = FakeGroupMessage(text="Count me", message_id=51)
+        await self.contest_bot.on_message(old_message)
+        await self.contest_bot.on_message(boundary_message)
+        untouched = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertIsNone(untouched.leader)
+
+        await self.contest_bot.on_message(new_message)
+        active = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(active.leader.user_id, 100)
+
     async def test_completed_intercept_form_starts_game(self) -> None:
         self._prepare_targets()
         await self.state.set_state(InterceptSetup.screenshot)
@@ -222,8 +242,9 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(active)
         self.assertEqual(active.intercept_seconds, 120)
         self.assertEqual(active.message_stars, 10)
+        self.assertEqual(active.tracking_after_message_id, 1)
         self.assertIsNone(await self.state.get_state())
-        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertEqual(self.bot.send_message.await_count, 2)
 
 
 if __name__ == "__main__":
