@@ -18,10 +18,13 @@ from app.bot import (
     CaseSetup,
     CasinoSetup,
     ContestBot,
+    FOOTBALL_BALL_ID,
+    FOOTBALL_STATUS_IDS,
     FootballSetup,
     FOOTBALLERS,
     GuessSetup,
     InterceptSetup,
+    SNAKE_IDS,
     football_pick_keyboard,
     game_key,
 )
@@ -54,6 +57,7 @@ class FakeGroupMessage:
         is_automatic_forward: bool = False,
         text: str | None = None,
         message_id: int = 10,
+        paid_star_count: int | None = None,
     ) -> None:
         self.chat = SimpleNamespace(
             id=-1001,
@@ -71,6 +75,7 @@ class FakeGroupMessage:
         self.is_automatic_forward = is_automatic_forward
         self.text = text
         self.message_id = message_id
+        self.paid_star_count = paid_star_count
         self.dice = (
             SimpleNamespace(emoji="🎰", value=value) if value is not None else None
         )
@@ -160,6 +165,8 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.send_message = AsyncMock(
             return_value=SimpleNamespace(message_id=1)
         )
+        self.bot.edit_message_text = AsyncMock()
+        self.bot.edit_message_caption = AsyncMock()
 
     async def test_completed_casino_form_starts_game(self) -> None:
         self._prepare_targets()
@@ -340,7 +347,7 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.message_stars, 10)
         self.assertEqual(active.tracking_after_message_id, 1)
 
-    async def test_football_setup_starts_automatic_prediction_round(self) -> None:
+    async def test_football_setup_starts_team_collection(self) -> None:
         self._prepare_targets()
         await self.state.set_state(FootballSetup.screenshot)
         await self.state.set_data(
@@ -367,24 +374,32 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
             for row in sent_markup.inline_keyboard
             for button in row
         ]
-        self.assertIn("football:pick:draw", callbacks)
+        self.assertIn("football:info:a", callbacks)
+        self.assertIn("football:info:b", callbacks)
         self.assertEqual(
             len([value for value in callbacks if value.startswith("football:player:")]),
             10,
         )
 
-    def test_football_keyboard_has_both_teams_draw_and_ten_players(self) -> None:
-        keyboard = football_pick_keyboard("Blue", "Red")
+    def test_football_keyboard_has_statuses_and_ten_players(self) -> None:
+        keyboard = football_pick_keyboard("Blue", "Red", {0, 7})
         callbacks = [
             button.callback_data
             for row in keyboard.inline_keyboard
             for button in row
         ]
         self.assertEqual(
-            callbacks[:3],
-            ["football:pick:a", "football:pick:draw", "football:pick:b"],
+            callbacks[:2],
+            ["football:info:a", "football:info:b"],
         )
-        self.assertEqual(len(callbacks), 13)
+        self.assertEqual(len(callbacks), 12)
+        player_buttons = [
+            button
+            for row in keyboard.inline_keyboard[1:]
+            for button in row
+        ]
+        self.assertEqual(player_buttons[0].icon_custom_emoji_id, FOOTBALL_STATUS_IDS[0])
+        self.assertEqual(player_buttons[1].icon_custom_emoji_id, FOOTBALL_STATUS_IDS[1])
 
     def test_airplane_animation_uses_premium_plane_and_twenty_percent_birds(self) -> None:
         alice = Participant(1, "Alice", "alice")
@@ -406,10 +421,12 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
         text = self.contest_bot._football_start_text("Blue", "Red", 20, 60)
         for _, emoji_id, _ in FOOTBALLERS:
             self.assertIn(emoji_id, text)
-        self.assertIn("1,5×", text)
-        self.assertIn("10 атак", text)
+        self.assertIn(FOOTBALL_BALL_ID, text)
+        self.assertIn(FOOTBALL_STATUS_IDS[1], text)
+        self.assertIn("1-е — 2×", text)
+        self.assertIn("Blue — 0/5", text)
 
-    async def test_football_win_announces_one_and_a_half_times_payout(self) -> None:
+    async def test_football_win_uses_selected_players_ranked_multiplier(self) -> None:
         participant = Participant(100, "Player", "player")
         state = ContestState(
             game_id=1,
@@ -419,19 +436,69 @@ class PrivatePanelFlowTests(unittest.IsolatedAsyncioTestCase):
             team_a_name="Blue",
             team_b_name="Red",
             participants={participant.user_id: participant},
-            football_picks={participant.user_id: "a"},
+            football_teams={participant.user_id: "a"},
             football_players={participant.user_id: 0},
         )
         self.contest_bot._safe_public = AsyncMock()
 
         await self.contest_bot._announce_football_result(
-            game_key(-1001), state, [2, 1]
+            game_key(-1001), state, [2, 1], [0, 1, 2, 3, 4]
         )
 
         text = self.contest_bot._safe_public.await_args.args[1]
-        self.assertIn("30 Stars", text)
+        self.assertIn("40 Stars", text)
+        self.assertIn("2×", text)
         self.assertIn("@player", text)
         self.assertIn(FOOTBALLERS[0][1], text)
+
+    async def test_football_join_requires_paid_team_name_message(self) -> None:
+        await self.contest_bot.manager.start_football(
+            game_key(-1001),
+            "Blue",
+            "Red",
+            60,
+            message_stars=20,
+            tracking_after_message_id=1,
+        )
+        unpaid = FakeGroupMessage(text="Blue", message_id=2)
+        await self.contest_bot.on_message(unpaid)
+        state = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(state.football_teams, {})
+        self.assertIn("Вход не засчитан", unpaid.replies[-1])
+
+        self.bot.edit_message_text = AsyncMock()
+        paid = FakeGroupMessage(
+            text="blue", message_id=3, paid_star_count=20
+        )
+        await self.contest_bot.on_message(paid)
+        state = await self.contest_bot.manager.snapshot(game_key(-1001))
+        self.assertEqual(state.football_teams[100], "a")
+        self.assertIn("вы в команде", paid.replies[-1])
+        self.bot.edit_message_text.assert_awaited_once()
+
+    def test_snake_moves_on_square_field_and_uses_requested_apple(self) -> None:
+        players = [Participant(index, f"Player {index}") for index in range(1, 6)]
+        frames = self.contest_bot._snake_frames(players, players[-1])
+
+        self.assertEqual(len(frames), 16)
+        self.assertTrue(all(SNAKE_IDS[1] in frame for frame in frames[:-1]))
+        self.assertNotEqual(frames[0], frames[1])
+        self.assertIn("⬛", frames[0])
+        self.assertIn("Победитель", frames[-1])
+
+    def test_pickaxe_frame_shows_downward_shaft_and_resources(self) -> None:
+        players = [Participant(index, f"Player {index}") for index in range(1, 6)]
+        counts = {player.user_id: 0 for player in players}
+        frame_top = self.contest_bot._pickaxe_frame(
+            players, counts, False, depth=0
+        )
+        frame_deep = self.contest_bot._pickaxe_frame(
+            players, counts, False, depth=8, mined_user_id=1
+        )
+
+        self.assertNotEqual(frame_top, frame_deep)
+        self.assertIn("Кирка копает вниз", frame_deep)
+        self.assertGreater(frame_deep.count("⬛"), frame_top.count("⬛"))
 
     async def test_football_draw_burns_every_prediction(self) -> None:
         state = ContestState(

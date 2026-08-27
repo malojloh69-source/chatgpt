@@ -59,7 +59,7 @@ class ContestState:
     case_drops: tuple[DropOutcome, ...] = ()
     team_a_name: str = ""
     team_b_name: str = ""
-    football_picks: dict[int, str] = field(default_factory=dict)
+    football_teams: dict[int, str] = field(default_factory=dict)
     football_players: dict[int, int] = field(default_factory=dict)
     processed_message_ids: set[int] = field(default_factory=set)
     generation: int = 0
@@ -121,12 +121,31 @@ class ParkourAttemptUpdate:
     finished_state: ContestState | None = None
 
 
+class FootballJoinStatus(Enum):
+    ACCEPTED = "accepted"
+    ALREADY_JOINED = "already_joined"
+    TEAM_FULL = "team_full"
+
+
 @dataclass(frozen=True, slots=True)
-class FootballPickUpdate:
-    accepted: bool
-    choice: str
-    changed: bool
+class FootballTeamJoinUpdate:
+    status: FootballJoinStatus
+    team: str
     counts: dict[str, int]
+
+
+class FootballPlayerStatus(Enum):
+    ACCEPTED = "accepted"
+    NOT_JOINED = "not_joined"
+    WRONG_TEAM = "wrong_team"
+    ALREADY_SELECTED = "already_selected"
+    OCCUPIED = "occupied"
+
+
+@dataclass(frozen=True, slots=True)
+class FootballPlayerUpdate:
+    status: FootballPlayerStatus
+    player_index: int
 
 
 class ContestManager:
@@ -176,7 +195,7 @@ class ContestManager:
             spin_available_at=dict(state.spin_available_at),
             participants=dict(state.participants),
             case_drops=tuple(state.case_drops),
-            football_picks=dict(state.football_picks),
+            football_teams=dict(state.football_teams),
             football_players=dict(state.football_players),
             processed_message_ids=set(state.processed_message_ids),
         )
@@ -558,41 +577,51 @@ class ContestManager:
                 finished_state=finished_state,
             )
 
-    async def submit_football_pick(
+    async def submit_football_team(
         self,
         key: ContestKey,
         participant: Participant,
-        choice: str,
-    ) -> FootballPickUpdate | None:
-        if choice not in {"a", "draw", "b"}:
+        team: str,
+    ) -> FootballTeamJoinUpdate | None:
+        if team not in {"a", "b"}:
             return None
         async with self._lock:
             state = self._states.get(key)
             if state is None or state.kind is not ContestType.FOOTBALL:
                 return None
             if (
-                state.tracking_after_message_id is None
-                or state.deadline is None
+                state.deadline is None
                 or state.deadline <= self._clock()
             ):
                 return None
-            previous = state.football_picks.get(participant.user_id)
-            state.participants[participant.user_id] = participant
-            state.football_picks[participant.user_id] = choice
+
             counts = {
-                option: sum(value == option for value in state.football_picks.values())
-                for option in ("a", "draw", "b")
+                option: sum(value == option for value in state.football_teams.values())
+                for option in ("a", "b")
             }
-            return FootballPickUpdate(True, choice, previous not in {None, choice}, counts)
+            previous = state.football_teams.get(participant.user_id)
+            if previous is not None:
+                return FootballTeamJoinUpdate(
+                    FootballJoinStatus.ALREADY_JOINED, previous, counts
+                )
+            if counts[team] >= 5:
+                return FootballTeamJoinUpdate(
+                    FootballJoinStatus.TEAM_FULL, team, counts
+                )
+
+            state.participants[participant.user_id] = participant
+            state.football_teams[participant.user_id] = team
+            counts[team] += 1
+            return FootballTeamJoinUpdate(FootballJoinStatus.ACCEPTED, team, counts)
 
     async def submit_football_player(
         self,
         key: ContestKey,
         participant: Participant,
         player_index: int,
-    ) -> bool:
+    ) -> FootballPlayerUpdate | None:
         if not 0 <= player_index < 10:
-            return False
+            return None
         async with self._lock:
             state = self._states.get(key)
             if (
@@ -601,10 +630,30 @@ class ContestManager:
                 or state.deadline is None
                 or state.deadline <= self._clock()
             ):
-                return False
-            state.participants[participant.user_id] = participant
+                return None
+
+            team = state.football_teams.get(participant.user_id)
+            if team is None:
+                return FootballPlayerUpdate(
+                    FootballPlayerStatus.NOT_JOINED, player_index
+                )
+            expected_team = "a" if player_index < 5 else "b"
+            if expected_team != team:
+                return FootballPlayerUpdate(
+                    FootballPlayerStatus.WRONG_TEAM, player_index
+                )
+            selected = state.football_players.get(participant.user_id)
+            if selected is not None:
+                return FootballPlayerUpdate(
+                    FootballPlayerStatus.ALREADY_SELECTED, selected
+                )
+            if player_index in state.football_players.values():
+                return FootballPlayerUpdate(
+                    FootballPlayerStatus.OCCUPIED, player_index
+                )
+
             state.football_players[participant.user_id] = player_index
-            return True
+            return FootballPlayerUpdate(FootballPlayerStatus.ACCEPTED, player_index)
 
     async def finish_collection_now(self, key: ContestKey) -> ContestState | None:
         async with self._lock:

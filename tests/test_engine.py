@@ -7,6 +7,8 @@ from app.engine import (
     ContestManager,
     ContestType,
     DropOutcome,
+    FootballJoinStatus,
+    FootballPlayerStatus,
     Participant,
     SpinStatus,
 )
@@ -238,7 +240,7 @@ class ContestManagerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.close()
 
-    async def test_football_prediction_can_be_changed_before_deadline(self) -> None:
+    async def test_football_teams_are_limited_and_player_choice_is_locked(self) -> None:
         await self.manager.start_football(
             self.key,
             "Blue",
@@ -247,22 +249,60 @@ class ContestManagerTests(unittest.IsolatedAsyncioTestCase):
             message_stars=10,
             tracking_after_message_id=500,
         )
-        first = await self.manager.submit_football_pick(self.key, self.alice, "a")
-        changed = await self.manager.submit_football_pick(
-            self.key, self.alice, "b"
+        joined = await self.manager.submit_football_team(
+            self.key, self.alice, "a"
         )
         player_selected = await self.manager.submit_football_player(
-            self.key, self.alice, 7
+            self.key, self.alice, 0
         )
-        self.assertIsNotNone(first)
-        self.assertFalse(first.changed)
-        self.assertIsNotNone(changed)
-        self.assertTrue(changed.changed)
-        self.assertTrue(player_selected)
-        self.assertEqual(changed.counts, {"a": 0, "draw": 0, "b": 1})
+        changed_player = await self.manager.submit_football_player(
+            self.key, self.alice, 1
+        )
+        changed_team = await self.manager.submit_football_team(
+            self.key, self.alice, "b"
+        )
+
+        self.assertEqual(joined.status, FootballJoinStatus.ACCEPTED)
+        self.assertEqual(player_selected.status, FootballPlayerStatus.ACCEPTED)
+        self.assertEqual(
+            changed_player.status, FootballPlayerStatus.ALREADY_SELECTED
+        )
+        self.assertEqual(changed_team.status, FootballJoinStatus.ALREADY_JOINED)
         state = await self.manager.snapshot(self.key)
-        self.assertEqual(state.football_picks[self.alice.user_id], "b")
-        self.assertEqual(state.football_players[self.alice.user_id], 7)
+        self.assertEqual(state.football_teams[self.alice.user_id], "a")
+        self.assertEqual(state.football_players[self.alice.user_id], 0)
+
+        for user_id in range(2, 6):
+            update = await self.manager.submit_football_team(
+                self.key, Participant(user_id, f"Player {user_id}"), "a"
+            )
+            self.assertEqual(update.status, FootballJoinStatus.ACCEPTED)
+        full = await self.manager.submit_football_team(
+            self.key, Participant(99, "Late player"), "a"
+        )
+        self.assertEqual(full.status, FootballJoinStatus.TEAM_FULL)
+
+    async def test_football_player_must_match_team_and_be_free(self) -> None:
+        await self.manager.start_football(self.key, "Blue", "Red", 60)
+        not_joined = await self.manager.submit_football_player(
+            self.key, self.alice, 0
+        )
+        await self.manager.submit_football_team(self.key, self.alice, "a")
+        wrong_team = await self.manager.submit_football_player(
+            self.key, self.alice, 5
+        )
+        selected = await self.manager.submit_football_player(
+            self.key, self.alice, 0
+        )
+        await self.manager.submit_football_team(self.key, self.bob, "a")
+        occupied = await self.manager.submit_football_player(
+            self.key, self.bob, 0
+        )
+
+        self.assertEqual(not_joined.status, FootballPlayerStatus.NOT_JOINED)
+        self.assertEqual(wrong_team.status, FootballPlayerStatus.WRONG_TEAM)
+        self.assertEqual(selected.status, FootballPlayerStatus.ACCEPTED)
+        self.assertEqual(occupied.status, FootballPlayerStatus.OCCUPIED)
 
 
 if __name__ == "__main__":
