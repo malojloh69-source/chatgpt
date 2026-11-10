@@ -6,12 +6,16 @@ import math
 import re
 import secrets
 import sys
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from decimal import ROUND_DOWN, Decimal
+from functools import wraps
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router, html
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,7 +30,9 @@ from aiogram.types import (
     User,
 )
 
+from . import simulations
 from .config import Settings
+from .emojis import BY_KEY, CATALOG, STICKER_ALTS, gallery, icon, premium
 from .engine import (
     ContestKey,
     ContestManager,
@@ -58,15 +64,15 @@ DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhсмч]?)\s*$", re.IGNORECASE)
 
 # Premium emoji IDs supplied in the brief, kept in the requested order.
 CASINO_START_IDS = (
-    "5213134259098761044",
-    "5400182197963496946",
-    "5436040291507247633",
+    BY_KEY["slots"].emoji_id,
+    BY_KEY["bunny"].emoji_id,
+    BY_KEY["star_eyes"].emoji_id,
 )
 CASINO_COMBINATION_ID = "5913646886819991524"
 WINNER_IDS = (
-    "5280769763398671636",
-    "5400182197963496946",
-    "5436040291507247633",
+    BY_KEY["trophy"].emoji_id,
+    BY_KEY["pink_bear"].emoji_id,
+    BY_KEY["duck_like"].emoji_id,
 )
 INTERCEPT_START_IDS = (
     "5213134259098761044",
@@ -126,7 +132,7 @@ FOOTBALLERS = (
     ("Месси", "5445275244287785469", "🐐"),
     ("Неймар", "5447264557175175819", "🇧🇷"),
     ("Винисиус", "5217692284551711148", "🇧🇷"),
-    ("Зидан", "5251235893234132621", "🇸🇪"),
+    ("Зидан", "5251235893234132621", "🇫🇷"),
     ("Роналдо прайм", "5465518047924081162", "🇧🇷"),
     ("Рональдино", "5465496852260476264", "🇧🇷"),
     ("Сон", "5361682145481881497", "🇰🇷"),
@@ -219,10 +225,6 @@ def participant_link(participant: Participant) -> str:
     )
 
 
-def premium(emoji_id: str, fallback: str) -> str:
-    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
-
-
 def without_premium(text: str) -> str:
     return CUSTOM_EMOJI_TAG_RE.sub("", text)
 
@@ -234,10 +236,7 @@ def without_premium_markup(
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                button.model_copy(update={"icon_custom_emoji_id": None})
-                for button in row
-            ]
+            [button.model_copy(update={"icon_custom_emoji_id": None}) for button in row]
             for row in markup.inline_keyboard
         ]
     )
@@ -350,24 +349,22 @@ def panel_keyboard(activity_enabled: bool = False) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🎰 777", callback_data="game:casino"),
-                InlineKeyboardButton(
-                    text="⚡ Перебив", callback_data="game:intercept"
-                ),
+                InlineKeyboardButton(text="⚡ Перебив", callback_data="game:intercept"),
             ],
             [
-                InlineKeyboardButton(text="🔢 Угадай число", callback_data="game:guess"),
+                InlineKeyboardButton(
+                    text="🔢 Угадай число", callback_data="game:guess"
+                ),
                 InlineKeyboardButton(text="🏎 Гонки", callback_data="game:race"),
             ],
             [InlineKeyboardButton(text="📦 Кейсы", callback_data="game:cases")],
             [
-                InlineKeyboardButton(
-                    text="✈️ Самолётик", callback_data="game:airplane"
-                ),
+                InlineKeyboardButton(text="✈️ Самолётик", callback_data="game:airplane"),
                 InlineKeyboardButton(text="🏃 Паркур", callback_data="game:parkour"),
             ],
             [
                 InlineKeyboardButton(text="🐍 Змейка", callback_data="game:snake"),
-                InlineKeyboardButton(text="💅 Кирка", callback_data="game:pickaxe"),
+                InlineKeyboardButton(text="⛏️ Кирка", callback_data="game:pickaxe"),
             ],
             [InlineKeyboardButton(text="⚽ Футбол", callback_data="game:football")],
             [
@@ -385,6 +382,11 @@ def panel_keyboard(activity_enabled: bool = False) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⛔ Стоп", callback_data="game:stop"),
             ],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="panel:home")],
+            [
+                InlineKeyboardButton(
+                    text="✨ Клеззи #Добри", callback_data="panel:emojis"
+                )
+            ],
         ]
     )
 
@@ -410,16 +412,24 @@ def cases_keyboard() -> InlineKeyboardMarkup:
 
 def case_drop_keyboard(has_drops: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="➕ Добавить новый дроп", callback_data="case:add_drop")],
+        [
+            InlineKeyboardButton(
+                text="➕ Добавить новый дроп", callback_data="case:add_drop"
+            )
+        ],
         [
             InlineKeyboardButton(
                 text="📚 Взять сохранённый дроп", callback_data="case:reuse_drop"
             )
-        ]
+        ],
     ]
     if has_drops:
         rows.append(
-            [InlineKeyboardButton(text="✅ Дропы готовы", callback_data="case:drops_ready")]
+            [
+                InlineKeyboardButton(
+                    text="✅ Дропы готовы", callback_data="case:drops_ready"
+                )
+            ]
         )
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="setup:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -511,13 +521,27 @@ def football_pick_keyboard(
             }
             if premium_icons:
                 button_args["icon_custom_emoji_id"] = (
-                    FOOTBALL_STATUS_IDS[0]
-                    if is_occupied
-                    else FOOTBALL_STATUS_IDS[1]
+                    FOOTBALL_STATUS_IDS[0] if is_occupied else FOOTBALL_STATUS_IDS[1]
                 )
             player_row.append(InlineKeyboardButton(**button_args))
         rows.append(player_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def serialized_launch(method):
+    """Keep the check, announcement and manager start in a single launch slot."""
+
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        async with self._launch_lock:
+            return await method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def progress(current: int, target: int, width: int = 8) -> str:
+    filled = min(width, max(0, round(width * current / max(1, target))))
+    return "🟩" * filled + "⬜" * (width - filled)
 
 
 class ContestBot:
@@ -526,12 +550,41 @@ class ContestBot:
         self.settings = settings
         self.storage = storage
         self._random = secrets.SystemRandom()
+        self._launch_lock = asyncio.Lock()
+        self._playing: dict[ContestKey, tuple[ContestState, asyncio.Task]] = {}
+        self._post_locks: dict[ContestKey, asyncio.Lock] = {}
+        self._intercept_boards: dict[ContestKey, tuple[Message, asyncio.Task]] = {}
+        self._recent_messages: OrderedDict[tuple[int, int], None] = OrderedDict()
         self.manager = ContestManager(
             self._announce_timed_winner,
             timed_finish_handler=self._finish_timed_game,
         )
         self.router = Router(name="monster-contests")
         self._register_handlers()
+
+    @asynccontextmanager
+    async def _game_phase(self, key: ContestKey, state: ContestState):
+        task = asyncio.current_task()
+        assert task is not None
+        self._playing[key] = (state, task)
+        try:
+            yield
+        finally:
+            if self._playing.get(key) == (state, task):
+                self._playing.pop(key, None)
+
+    async def close(self) -> None:
+        tasks = {
+            task
+            for _, task in self._playing.values()
+            if task is not asyncio.current_task()
+        }
+        tasks.update(task for _, task in self._intercept_boards.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.manager.close()
 
     def _register_handlers(self) -> None:
         self.router.my_chat_member.register(self.on_my_chat_member)
@@ -546,6 +599,7 @@ class ContestBot:
         self.router.message.register(self.cmd_panel, Command("contest"))
 
         self.router.callback_query.register(self.cb_panel, F.data == "panel:home")
+        self.router.callback_query.register(self.cb_emojis, F.data == "panel:emojis")
         self.router.callback_query.register(
             self.cb_choose_group, F.data == "panel:group"
         )
@@ -558,15 +612,9 @@ class ContestBot:
         self.router.callback_query.register(
             self.cb_intercept_setup, F.data == "game:intercept"
         )
-        self.router.callback_query.register(
-            self.cb_guess_setup, F.data == "game:guess"
-        )
-        self.router.callback_query.register(
-            self.cb_race_setup, F.data == "game:race"
-        )
-        self.router.callback_query.register(
-            self.cb_cases, F.data == "game:cases"
-        )
+        self.router.callback_query.register(self.cb_guess_setup, F.data == "game:guess")
+        self.router.callback_query.register(self.cb_race_setup, F.data == "game:race")
+        self.router.callback_query.register(self.cb_cases, F.data == "game:cases")
         self.router.callback_query.register(
             self.cb_arcade_setup,
             F.data.in_(
@@ -590,12 +638,8 @@ class ContestBot:
         self.router.callback_query.register(
             self.cb_create_case, F.data == "case:create"
         )
-        self.router.callback_query.register(
-            self.cb_saved_cases, F.data == "case:saved"
-        )
-        self.router.callback_query.register(
-            self.cb_saved_drops, F.data == "case:drops"
-        )
+        self.router.callback_query.register(self.cb_saved_cases, F.data == "case:saved")
+        self.router.callback_query.register(self.cb_saved_drops, F.data == "case:drops")
         self.router.callback_query.register(
             self.cb_reuse_drop, F.data == "case:reuse_drop"
         )
@@ -614,9 +658,7 @@ class ContestBot:
         self.router.callback_query.register(
             self.cb_toggle_activity, F.data == "game:activity"
         )
-        self.router.callback_query.register(
-            self.cb_status, F.data == "game:status"
-        )
+        self.router.callback_query.register(self.cb_status, F.data == "game:status")
         self.router.callback_query.register(self.cb_stop, F.data == "game:stop")
         self.router.callback_query.register(
             self.cb_cancel_setup, F.data == "setup:cancel"
@@ -650,15 +692,11 @@ class ContestBot:
         self.router.message.register(
             self.receive_casino_screenshot, CasinoSetup.screenshot
         )
-        self.router.message.register(
-            self.receive_intercept_prize, InterceptSetup.prize
-        )
+        self.router.message.register(self.receive_intercept_prize, InterceptSetup.prize)
         self.router.message.register(
             self.receive_intercept_duration, InterceptSetup.duration
         )
-        self.router.message.register(
-            self.receive_intercept_stars, InterceptSetup.stars
-        )
+        self.router.message.register(self.receive_intercept_stars, InterceptSetup.stars)
         self.router.message.register(
             self.receive_intercept_screenshot, InterceptSetup.screenshot
         )
@@ -672,29 +710,19 @@ class ContestBot:
         self.router.message.register(self.receive_guess_stars, GuessSetup.stars)
         self.router.message.register(self.receive_race_prize, RaceSetup.prize)
         self.router.message.register(self.receive_race_stars, RaceSetup.stars)
-        self.router.message.register(
-            self.receive_race_duration, RaceSetup.duration
-        )
-        self.router.message.register(
-            self.receive_race_screenshot, RaceSetup.screenshot
-        )
+        self.router.message.register(self.receive_race_duration, RaceSetup.duration)
+        self.router.message.register(self.receive_race_screenshot, RaceSetup.screenshot)
         self.router.message.register(self.receive_case_drop_name, CaseSetup.drop_name)
         self.router.message.register(
             self.receive_case_drop_chance, CaseSetup.drop_chance
         )
         self.router.message.register(self.receive_case_name, CaseSetup.name)
         self.router.message.register(self.receive_case_stars, CaseSetup.stars)
-        self.router.message.register(
-            self.receive_case_duration, CaseSetup.duration
-        )
-        self.router.message.register(
-            self.receive_case_screenshot, CaseSetup.screenshot
-        )
+        self.router.message.register(self.receive_case_duration, CaseSetup.duration)
+        self.router.message.register(self.receive_case_screenshot, CaseSetup.screenshot)
         self.router.message.register(self.receive_arcade_prize, ArcadeSetup.prize)
         self.router.message.register(self.receive_arcade_stars, ArcadeSetup.stars)
-        self.router.message.register(
-            self.receive_arcade_duration, ArcadeSetup.duration
-        )
+        self.router.message.register(self.receive_arcade_duration, ArcadeSetup.duration)
         self.router.message.register(
             self.receive_arcade_screenshot, ArcadeSetup.screenshot
         )
@@ -747,8 +775,7 @@ class ContestBot:
         if self.storage.is_authorized(message.from_user.id):
             return True
         await message.answer(
-            "🔒 <b>Доступ закрыт.</b>\n\n"
-            "Введите выданный вам промокод-команду."
+            "🔒 <b>Доступ закрыт.</b>\n\nВведите выданный вам промокод-команду."
         )
         return False
 
@@ -837,6 +864,27 @@ class ContestBot:
                 reply_markup=self._panel_keyboard(callback.from_user.id),
             )
 
+    async def cb_emojis(self, callback: CallbackQuery) -> None:
+        if not await self._require_access_callback(callback):
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._send_public(callback.message.chat.id, gallery())
+
+    async def load_emoji_alts(self) -> None:
+        ids = list(dict.fromkeys(item.emoji_id for item in CATALOG))
+        try:
+            stickers = await self.bot.get_custom_emoji_stickers(ids)
+            STICKER_ALTS.update(
+                {
+                    sticker.custom_emoji_id: sticker.emoji
+                    for sticker in stickers
+                    if sticker.custom_emoji_id and sticker.emoji
+                }
+            )
+        except TelegramAPIError:
+            logger.info("Custom emoji metadata unavailable; using screenshot fallbacks")
+
     async def _available_chats(
         self, user_id: int, kinds: tuple[str, ...]
     ) -> list[KnownChat]:
@@ -864,9 +912,7 @@ class ContestBot:
                 "\n\nСписок пуст. Добавьте бота в группу, сделайте себя "
                 "администратором и отправьте там любое сообщение, затем обновите панель."
             )
-        await callback.message.edit_text(
-            text, reply_markup=choices_keyboard(chats)
-        )
+        await callback.message.edit_text(text, reply_markup=choices_keyboard(chats))
 
     async def cb_pick_group(self, callback: CallbackQuery) -> None:
         if not await self._require_access_callback(callback):
@@ -880,8 +926,12 @@ class ContestBot:
             await callback.answer("Некорректный выбор", show_alert=True)
             return
         chat = self.storage.get_chat(chat_id)
-        if chat is None or not await self._is_user_admin(chat_id, callback.from_user.id):
-            await callback.answer("Вы больше не администратор этого чата", show_alert=True)
+        if chat is None or not await self._is_user_admin(
+            chat_id, callback.from_user.id
+        ):
+            await callback.answer(
+                "Вы больше не администратор этого чата", show_alert=True
+            )
             return
         if chat.kind not in {ChatType.GROUP.value, ChatType.SUPERGROUP.value}:
             await callback.answer("Это не группа", show_alert=True)
@@ -903,9 +953,7 @@ class ContestBot:
             return "Назначьте бота администратором выбранной группы."
         return targets.group_id
 
-    async def cb_casino_setup(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_casino_setup(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         targets = await self._validate_targets(callback.from_user.id)
@@ -923,9 +971,7 @@ class ContestBot:
                 reply_markup=back_keyboard(),
             )
 
-    async def receive_casino_prize(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_casino_prize(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         if not message.text or not message.text.strip():
@@ -943,9 +989,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_casino_target(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_casino_target(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         raw = (message.text or "").strip()
@@ -975,7 +1019,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -992,8 +1038,11 @@ class ContestBot:
             return
         await callback.answer()
         if isinstance(callback.message, Message):
-            await self._finish_casino_setup(callback.message, state, callback.from_user.id)
+            await self._finish_casino_setup(
+                callback.message, state, callback.from_user.id
+            )
 
+    @serialized_launch
     async def _finish_casino_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1004,7 +1053,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1123,7 +1175,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -1144,6 +1198,7 @@ class ContestBot:
                 callback.message, state, callback.from_user.id
             )
 
+    @serialized_launch
     async def _finish_intercept_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1154,7 +1209,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1194,9 +1252,7 @@ class ContestBot:
             reply_markup=home_keyboard(),
         )
 
-    async def cb_guess_setup(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_guess_setup(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         targets = await self._validate_targets(callback.from_user.id)
@@ -1235,7 +1291,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -1254,9 +1312,7 @@ class ContestBot:
         if isinstance(callback.message, Message):
             await self._continue_guess_setup(callback.message, state)
 
-    async def _continue_guess_setup(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def _continue_guess_setup(self, message: Message, state: FSMContext) -> None:
         await state.set_state(GuessSetup.secret_number)
         await message.answer(
             "Какое число должны угадать участники?\n"
@@ -1264,9 +1320,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_guess_number(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_guess_number(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         raw = (message.text or "").strip()
@@ -1281,9 +1335,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_guess_stars(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_guess_stars(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         stars = parse_stars(message.text or "")
@@ -1293,6 +1345,7 @@ class ContestBot:
         await state.update_data(stars=stars)
         await self._finish_guess_setup(message, state)
 
+    @serialized_launch
     async def _finish_guess_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1303,7 +1356,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1323,8 +1379,7 @@ class ContestBot:
             )
         except TelegramAPIError as exc:
             await message.answer(
-                "Не удалось опубликовать игру: "
-                f"<code>{html.quote(str(exc))}</code>"
+                f"Не удалось опубликовать игру: <code>{html.quote(str(exc))}</code>"
             )
             return
         await self.manager.start_guess(
@@ -1339,9 +1394,7 @@ class ContestBot:
             "✅ <b>«Угадай число» запущена.</b>", reply_markup=home_keyboard()
         )
 
-    async def cb_race_setup(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_race_setup(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         targets = await self._validate_targets(callback.from_user.id)
@@ -1387,9 +1440,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_race_duration(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_race_duration(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         duration = parse_duration(message.text or "")
@@ -1410,7 +1461,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -1427,8 +1480,11 @@ class ContestBot:
             return
         await callback.answer()
         if isinstance(callback.message, Message):
-            await self._finish_race_setup(callback.message, state, callback.from_user.id)
+            await self._finish_race_setup(
+                callback.message, state, callback.from_user.id
+            )
 
+    @serialized_launch
     async def _finish_race_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1439,7 +1495,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1459,8 +1518,7 @@ class ContestBot:
             )
         except TelegramAPIError as exc:
             await message.answer(
-                "Не удалось опубликовать гонку: "
-                f"<code>{html.quote(str(exc))}</code>"
+                f"Не удалось опубликовать гонку: <code>{html.quote(str(exc))}</code>"
             )
             return
         await self.manager.start_race(
@@ -1475,9 +1533,7 @@ class ContestBot:
             "✅ <b>Набор на гонку начался.</b>", reply_markup=home_keyboard()
         )
 
-    async def cb_arcade_setup(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_arcade_setup(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         targets = await self._validate_targets(callback.from_user.id)
@@ -1497,14 +1553,11 @@ class ContestBot:
         await callback.answer()
         if isinstance(callback.message, Message):
             await callback.message.answer(
-                f"<b>Настройка игры «{title}»</b>\n\n"
-                "Введите приз текстом или ссылкой.",
+                f"<b>Настройка игры «{title}»</b>\n\nВведите приз текстом или ссылкой.",
                 reply_markup=back_keyboard(),
             )
 
-    async def receive_arcade_prize(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_arcade_prize(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         prize = (message.text or "").strip()
@@ -1519,9 +1572,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_arcade_stars(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_arcade_stars(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         stars = parse_stars(message.text or "")
@@ -1559,7 +1610,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -1580,6 +1633,7 @@ class ContestBot:
                 callback.message, state, callback.from_user.id
             )
 
+    @serialized_launch
     async def _finish_arcade_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1590,7 +1644,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1665,7 +1722,9 @@ class ContestBot:
             return
         await state.update_data(team_a=name)
         await state.set_state(FootballSetup.team_b)
-        await message.answer("Введите название красной команды.", reply_markup=back_keyboard())
+        await message.answer(
+            "Введите название красной команды.", reply_markup=back_keyboard()
+        )
 
     async def receive_football_team_b(
         self, message: Message, state: FSMContext
@@ -1688,9 +1747,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_football_stars(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_football_stars(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         stars = parse_stars(message.text or "")
@@ -1728,7 +1785,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -1749,6 +1808,7 @@ class ContestBot:
                 callback.message, state, callback.from_user.id
             )
 
+    @serialized_launch
     async def _finish_football_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
     ) -> None:
@@ -1759,7 +1819,10 @@ class ContestBot:
             await state.clear()
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -1812,6 +1875,8 @@ class ContestBot:
             return
         try:
             player_index = int(callback.data.rsplit(":", 1)[-1])
+            if not 0 <= player_index < len(FOOTBALLERS):
+                raise ValueError("player index out of range")
             player_name = FOOTBALLERS[player_index][0]
         except (ValueError, IndexError):
             await callback.answer("Неизвестный футболист", show_alert=True)
@@ -1826,7 +1891,10 @@ class ContestBot:
             await callback.answer("Выбор игроков уже завершён", show_alert=True)
             return
         update = await self.manager.submit_football_player(
-            key, participant_from(callback.from_user), player_index
+            key,
+            participant_from(callback.from_user),
+            player_index,
+            game_id=state.game_id,
         )
         if update is None:
             await callback.answer("Выбор игроков уже завершён", show_alert=True)
@@ -1853,10 +1921,16 @@ class ContestBot:
             await callback.answer("Этот футболист уже занят.", show_alert=True)
             return
 
+        await callback.answer(f"Ваш футболист: {player_name}. Выбор зафиксирован.")
         latest = await self.manager.snapshot(key)
         if latest is not None:
             await self._refresh_football_post(key, latest)
-        await callback.answer(f"Ваш футболист: {player_name}. Выбор зафиксирован.")
+        if update.collection_ready:
+            finished = await self.manager.finish_collection_now(
+                key, game_id=state.game_id
+            )
+            if finished is not None:
+                await self._finish_timed_game(key, finished)
 
     async def cb_cases(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
@@ -1869,14 +1943,11 @@ class ContestBot:
         await callback.answer()
         if isinstance(callback.message, Message):
             await callback.message.edit_text(
-                "📦 <b>Кейсы</b>\n\n"
-                "Создайте новый кейс или запустите сохранённый.",
+                "📦 <b>Кейсы</b>\n\nСоздайте новый кейс или запустите сохранённый.",
                 reply_markup=cases_keyboard(),
             )
 
-    async def cb_create_case(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_create_case(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         targets = await self._validate_targets(callback.from_user.id)
@@ -1914,9 +1985,7 @@ class ContestBot:
                 reply_markup=case_drop_keyboard(bool(data.get("drop_ids"))),
             )
 
-    async def receive_case_drop_name(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_case_drop_name(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         name = (message.text or "").strip()
@@ -1964,9 +2033,7 @@ class ContestBot:
             reply_markup=case_drop_keyboard(True),
         )
 
-    async def cb_reuse_drop(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_reuse_drop(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         data = await state.get_data()
@@ -2072,9 +2139,7 @@ class ContestBot:
             reply_markup=back_keyboard(),
         )
 
-    async def receive_case_duration(
-        self, message: Message, state: FSMContext
-    ) -> None:
+    async def receive_case_duration(self, message: Message, state: FSMContext) -> None:
         if not await self._require_access_message(message):
             return
         duration = parse_duration(message.text or "")
@@ -2095,7 +2160,9 @@ class ContestBot:
             return
         screenshot = self._screenshot_from(message)
         if screenshot is None:
-            await message.answer("Отправьте фото/изображение или нажмите «Без скриншота».")
+            await message.answer(
+                "Отправьте фото/изображение или нажмите «Без скриншота»."
+            )
             return
         await state.update_data(
             screenshot_kind=screenshot[0], screenshot_file_id=screenshot[1]
@@ -2112,7 +2179,9 @@ class ContestBot:
             return
         await callback.answer()
         if isinstance(callback.message, Message):
-            await self._finish_case_setup(callback.message, state, callback.from_user.id)
+            await self._finish_case_setup(
+                callback.message, state, callback.from_user.id
+            )
 
     async def _finish_case_setup(
         self, message: Message, state: FSMContext, user_id: int | None = None
@@ -2131,9 +2200,7 @@ class ContestBot:
         await state.clear()
         await self._launch_saved_case(message, operator_id, saved_case)
 
-    async def cb_saved_cases(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_saved_cases(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         await state.clear()
@@ -2147,9 +2214,7 @@ class ContestBot:
                 text, reply_markup=saved_cases_keyboard(cases)
             )
 
-    async def cb_saved_drops(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_saved_drops(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         await state.clear()
@@ -2188,6 +2253,7 @@ class ContestBot:
             callback.message, callback.from_user.id, saved_case
         )
 
+    @serialized_launch
     async def _launch_saved_case(
         self, message: Message, operator_id: int, saved_case: SavedCase
     ) -> None:
@@ -2196,7 +2262,10 @@ class ContestBot:
             await message.answer(targets, reply_markup=home_keyboard())
             return
         group_id = targets
-        if await self.manager.snapshot(game_key(group_id)) is not None:
+        if (
+            await self.manager.snapshot(game_key(group_id)) is not None
+            or game_key(group_id) in self._playing
+        ):
             await message.answer(
                 "В выбранном чате уже идёт игра. Сначала остановите её в панели.",
                 reply_markup=home_keyboard(),
@@ -2211,8 +2280,7 @@ class ContestBot:
             )
         except TelegramAPIError as exc:
             await message.answer(
-                "Не удалось опубликовать кейс: "
-                f"<code>{html.quote(str(exc))}</code>"
+                f"Не удалось опубликовать кейс: <code>{html.quote(str(exc))}</code>"
             )
             return
         drops = tuple(DropOutcome(drop.name, drop.chance) for drop in saved_case.drops)
@@ -2253,9 +2321,7 @@ class ContestBot:
                 reply_markup=self._panel_keyboard(callback.from_user.id),
             )
 
-    async def cb_cancel_setup(
-        self, callback: CallbackQuery, state: FSMContext
-    ) -> None:
+    async def cb_cancel_setup(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_access_callback(callback):
             return
         await state.clear()
@@ -2273,11 +2339,16 @@ class ContestBot:
         if targets.group_id is None:
             await callback.answer("Сначала выберите чат", show_alert=True)
             return
-        state = await self.manager.snapshot(game_key(targets.group_id))
+        key = game_key(targets.group_id)
+        state = await self.manager.snapshot(key)
         await callback.answer()
         if isinstance(callback.message, Message):
-            await callback.message.answer(self._status_text(state))
+            text = self._status_text(state)
+            if key in self._playing:
+                text = "🎬 <b>Игра идёт.</b> Набор закрыт, показываем события и итог."
+            await self._reply_with_fallback(callback.message, text)
 
+    @serialized_launch
     async def cb_stop(self, callback: CallbackQuery) -> None:
         if not await self._require_access_callback(callback):
             return
@@ -2288,10 +2359,27 @@ class ContestBot:
         if not await self._is_user_admin(targets.group_id, callback.from_user.id):
             await callback.answer("Вы больше не администратор чата", show_alert=True)
             return
-        stopped = await self.manager.stop(game_key(targets.group_id))
+        key = game_key(targets.group_id)
+        stopped = await self.manager.stop(key)
+        playing = self._playing.get(key)
+        if playing:
+            stopped = playing[0]
+            playing[1].cancel()
+            await asyncio.gather(playing[1], return_exceptions=True)
+        board = self._intercept_boards.pop(key, None)
+        if board:
+            board[1].cancel()
         await callback.answer("Игра остановлена" if stopped else "Активной игры нет")
         if stopped and isinstance(callback.message, Message):
-            await callback.message.answer("⛔ Игра остановлена без победителя.")
+            note = "⛔ Игра остановлена без победителя."
+            if stopped.kind is ContestType.FOOTBALL:
+                note += " Оплаченные входы нужно вернуть вручную."
+            await callback.message.answer(note)
+        if stopped and stopped.kind is ContestType.FOOTBALL:
+            await self._safe_public(
+                key[0],
+                self._football_refund_text(stopped, "Матч остановлен организатором."),
+            )
 
     async def on_message(self, message: Message) -> None:
         await self._remember_chat(message.chat)
@@ -2312,6 +2400,30 @@ class ContestBot:
             or (message.text and message.text.startswith("/"))
         ):
             return
+        content_type = getattr(message, "content_type", None)
+        if content_type is not None and content_type not in {
+            "text",
+            "animation",
+            "audio",
+            "dice",
+            "document",
+            "photo",
+            "sticker",
+            "video",
+            "voice",
+            "video_note",
+            "contact",
+            "location",
+            "poll",
+        }:
+            return
+        # Telegram retries and activity drops share one receipt per incoming message.
+        receipt = (message.chat.id, message.message_id)
+        if receipt in self._recent_messages:
+            return
+        self._recent_messages[receipt] = None
+        if len(self._recent_messages) > 10000:
+            self._recent_messages.popitem(last=False)
 
         participant = participant_from(message.from_user)
         if self.storage.is_activity_enabled(message.chat.id):
@@ -2348,13 +2460,16 @@ class ContestBot:
                 return
 
             update = await self.manager.submit_football_team(
-                key, participant, team
+                key,
+                participant,
+                team,
+                message.message_id,
+                game_id=state.game_id,
+                paid_stars=paid_stars,
             )
             if update is None:
                 return
-            team_name = (
-                state.team_a_name if update.team == "a" else state.team_b_name
-            )
+            team_name = state.team_a_name if update.team == "a" else state.team_b_name
             if update.status is FootballJoinStatus.TEAM_FULL:
                 await self._reply_with_fallback(
                     message,
@@ -2384,22 +2499,11 @@ class ContestBot:
             return
 
         if state.kind is ContestType.INTERCEPT:
-            update = await self.manager.submit_intercept(key, participant)
+            update = await self.manager.submit_intercept(
+                key, participant, message.message_id, game_id=state.game_id
+            )
             if update and update.accepted:
-                if update.first_leader:
-                    text = (
-                        f"{premium(INTERCEPT_UPDATE_IDS[1], '👤')} "
-                        f"<b>Лидер:</b> {participant_link(participant)}\n"
-                        f"<b>До конца:</b> {format_duration(update.remaining_seconds)}"
-                    )
-                else:
-                    text = (
-                        f"{premium(INTERCEPT_UPDATE_IDS[0], '🧢')} <b>Перебито!</b>\n"
-                        f"{premium(INTERCEPT_UPDATE_IDS[1], '👤')} "
-                        f"<b>Новый лидер:</b> {participant_link(participant)}\n"
-                        f"<b>До конца:</b> {format_duration(update.remaining_seconds)}"
-                    )
-                await self._reply_with_fallback(message, text)
+                await self._show_intercept_board(message, key, state.game_id)
             return
 
         if (
@@ -2419,26 +2523,32 @@ class ContestBot:
             assert reservation.game_id is not None
             result = await self.manager.resolve_spin(
                 key,
-                reservation.game_id,
+                state.game_id,
                 participant,
                 message.dice.value,
+                message.message_id,
             )
             if result is None or not result.jackpot:
                 return
             if result.winner and result.finished_state:
-                await message.reply(
-                    "🎰 <b>777! Победа засчитана.</b> "
-                    f"Победитель: {participant_link(result.winner)}"
-                )
-                await asyncio.sleep(3.2)
-                await self._announce_winner(
-                    key, result.winner, result.finished_state
+                await self._finish_instant(
+                    key,
+                    result.winner,
+                    result.finished_state,
+                    message,
+                    [
+                        (
+                            f"{icon('slots')} <b>777! Победа засчитана.</b> "
+                            f"Победитель: {participant_link(result.winner)}"
+                        )
+                    ],
                 )
             else:
-                await message.reply(
-                    "🎰 <b>777 засчитано!</b> "
-                    f"{participant_link(participant)} — "
-                    f"<b>{result.hits}/{result.target}</b>"
+                await self._reply_with_fallback(
+                    message,
+                    f"{icon('seven')}{icon('seven')}{icon('seven')} <b>777 засчитано!</b>\n"
+                    f"{participant_link(participant)} — <b>{result.hits}/{result.target}</b>\n"
+                    f"{progress(result.hits, result.target)}",
                 )
             return
 
@@ -2446,17 +2556,36 @@ class ContestBot:
             raw = (message.text or "").strip()
             if not raw.isdigit() or not 1 <= int(raw) <= 100:
                 return
-            result = await self.manager.submit_guess(key, participant, int(raw))
+            result = await self.manager.submit_guess(
+                key, participant, int(raw), message.message_id, game_id=state.game_id
+            )
             if result is not None:
                 winner, finished_state = result
-                await message.reply(
-                    f"🔢 <b>Число {finished_state.secret_number} угадано!</b>"
+                await self._finish_instant(
+                    key,
+                    winner,
+                    finished_state,
+                    message,
+                    [
+                        f"{icon('frozen_brain')} <b>Проверяем число…</b>",
+                        f"{icon('star_eyes')} <b>Число {finished_state.secret_number} угадано!</b>",
+                    ],
                 )
-                await self._announce_winner(key, winner, finished_state)
+            else:
+                latest = await self.manager.snapshot(key)
+                if latest is not None and latest.game_id == state.game_id:
+                    count = latest.attempts.get(participant.user_id, 0)
+                    await self._reply_with_fallback(
+                        message,
+                        f"{icon('upside_down')} <b>{raw}</b> — не то число. Попытка №{count}.\n"
+                        "Следующее число — от 1 до 100.",
+                    )
             return
 
         if state.kind is ContestType.RACE:
-            update = await self.manager.submit_race(key, participant)
+            update = await self.manager.submit_race(
+                key, participant, message.message_id, game_id=state.game_id
+            )
             if update and update.accepted:
                 await message.reply(
                     f"🏎 {participant_link(participant)}, вы в гонке! "
@@ -2469,9 +2598,11 @@ class ContestBot:
             ContestType.SNAKE,
             ContestType.PICKAXE,
         }:
-            update = await self.manager.submit_arcade_join(key, participant)
+            update = await self.manager.submit_arcade_join(
+                key, participant, message.message_id, game_id=state.game_id
+            )
             if update and update.accepted:
-                icon = {
+                join_icon = {
                     ContestType.AIRPLANE: premium(AIRPLANE_IDS[0], "✈️"),
                     ContestType.SNAKE: premium(SNAKE_IDS[1], "🍎"),
                     ContestType.PICKAXE: premium(PICKAXE_IDS[0], "⛏️"),
@@ -2483,46 +2614,55 @@ class ContestBot:
                 }
                 await self._reply_with_fallback(
                     message,
-                    f"{icon} {participant_link(participant)}, участие принято! "
+                    f"{join_icon} {participant_link(participant)}, участие принято! "
                     f"Участников: <b>{update.participant_count}/{limits[state.kind]}</b>.",
                 )
                 if update.collection_ready:
-                    finished = await self.manager.finish_collection_now(key)
+                    finished = await self.manager.finish_collection_now(
+                        key, game_id=state.game_id
+                    )
                     if finished is not None:
                         await self._finish_timed_game(key, finished)
             return
 
         if state.kind is ContestType.PARKOUR:
             attempt = await self.manager.submit_parkour(
-                key, participant, message.message_id
+                key, participant, message.message_id, game_id=state.game_id
             )
             if attempt is None:
                 return
-            await self._reply_with_fallback(
-                message, self._parkour_attempt_text(participant, attempt)
-            )
+            frames = self._parkour_attempt_frames(participant, attempt)
             if attempt.winner is not None and attempt.finished_state is not None:
-                await self._announce_winner(
-                    key, attempt.winner, attempt.finished_state
+                await self._finish_instant(
+                    key, attempt.winner, attempt.finished_state, message, frames
                 )
+            else:
+                await self._reveal(message, frames)
             return
 
         if state.kind is ContestType.CASE:
-            opened = await self.manager.open_case(key, message.message_id)
+            opened = await self.manager.open_case(
+                key, message.message_id, game_id=state.game_id
+            )
             if opened is None:
                 return
+            title = f"📦 <b>{html.quote(opened.state.case_name)}</b>"
             if opened.outcome is None:
-                await message.reply(
-                    f"📦 <b>{html.quote(opened.state.case_name)}</b> открыт. "
-                    "В этот раз кейс пуст."
-                )
+                final = f"{title} открыт. {icon('sweat')} В этот раз кейс пуст."
             else:
-                await message.reply(
-                    f"📦 <b>{html.quote(opened.state.case_name)}</b> открыт!\n"
-                    f"🎁 {participant_link(participant)} получает "
+                final = (
+                    f"{title} открыт!\n{icon('bunny')} {participant_link(participant)} — к выдаче "
                     f"<b>{html.quote(opened.outcome.name)}</b>.\n\n"
                     f"<b>{html.quote(self.settings.prize_call)}</b>"
                 )
+            await self._reveal(
+                message,
+                [
+                    f"{title}\n\n{icon('bar_vertical')} {icon('bar')} {icon('berries')}\nОткрываем…",
+                    f"{title}\n\n{icon('duck_phone')} Проверяем содержимое…",
+                    final,
+                ],
+            )
             return
 
     async def _process_activity_message(
@@ -2539,11 +2679,126 @@ class ContestBot:
         )
         await self._reply_with_fallback(message, text)
 
-    async def _reply_with_fallback(self, message: Message, text: str) -> None:
+    async def _reply_with_fallback(self, message: Message, text: str) -> Message:
         try:
-            await message.reply(text)
+            return await message.reply(text)
         except TelegramBadRequest:
-            await message.reply(without_premium(text))
+            return await message.reply(without_premium(text))
+
+    async def _edit_frame(self, message: Message, text: str) -> bool:
+        """Animation failure must not discard an already computed result."""
+        for attempt in range(2):
+            try:
+                await message.edit_text(text)
+                return True
+            except TelegramRetryAfter as exc:
+                if attempt or exc.retry_after > 10:
+                    return False
+                await asyncio.sleep(exc.retry_after)
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return True
+                if "<tg-emoji" in text:
+                    text = without_premium(text)
+                    continue
+                return False
+            except TelegramAPIError:
+                return False
+        return False
+
+    async def _animate(
+        self, chat_id: int, frames: list[str], *, delay: float = 1.0
+    ) -> None:
+        if not frames:
+            return
+        if not self.settings.animations_enabled:
+            frames = frames[-1:]
+        try:
+            message = await self._send_public(chat_id, frames[0])
+            for frame in frames[1:]:
+                await asyncio.sleep(self.settings.animation_step_seconds * delay)
+                if not await self._edit_frame(message, frame):
+                    break
+        except TelegramAPIError:
+            logger.warning(
+                "Animation unavailable; publishing final result", exc_info=True
+            )
+
+    async def _reveal(self, message: Message, frames: list[str]) -> None:
+        try:
+            if not self.settings.animations_enabled:
+                frames = frames[-1:]
+            reply = await self._reply_with_fallback(message, frames[0])
+            for frame in frames[1:]:
+                if reply is None:  # Lightweight test transports may return no Message.
+                    await self._reply_with_fallback(message, frames[-1])
+                    break
+                await asyncio.sleep(self.settings.animation_step_seconds)
+                if not await self._edit_frame(reply, frame):
+                    await self._reply_with_fallback(message, frames[-1])
+                    break
+        except TelegramAPIError:
+            logger.warning("Could not show attempt animation", exc_info=True)
+
+    async def _finish_instant(
+        self,
+        key: ContestKey,
+        winner: Participant,
+        state: ContestState,
+        message: Message,
+        frames: list[str],
+    ) -> None:
+        async with self._game_phase(key, state):
+            await self._reveal(message, frames)
+            await self._announce_winner(key, winner, state)
+
+    def _intercept_board_text(self, state: ContestState) -> str:
+        remaining = max(0, (state.deadline or 0) - asyncio.get_running_loop().time())
+        leader = participant_link(state.leader) if state.leader else "ожидаем участника"
+        return (
+            f"{icon('duck_like')} <b>Перебив · лидер:</b> {leader}\n\n"
+            f"{progress(math.ceil(remaining), math.ceil(state.intercept_seconds or 1))}\n"
+            f"До победы: <b>{format_duration(remaining)}</b>\n"
+            "Сообщение другого участника запускает отсчёт заново."
+        )
+
+    async def _show_intercept_board(
+        self, message: Message, key: ContestKey, game_id: int
+    ) -> None:
+        async with self._post_locks.setdefault(key, asyncio.Lock()):
+            state = await self.manager.snapshot(key)
+            if state is None or state.game_id != game_id:
+                return
+            previous = self._intercept_boards.get(key)
+            if previous:
+                previous[1].cancel()
+                board = previous[0]
+                await self._edit_frame(board, self._intercept_board_text(state))
+            else:
+                board = await self._reply_with_fallback(
+                    message, self._intercept_board_text(state)
+                )
+            if board is not None:
+                task = asyncio.create_task(
+                    self._live_intercept(key, state.game_id, state.generation, board)
+                )
+                self._intercept_boards[key] = (board, task)
+
+    async def _live_intercept(
+        self, key: ContestKey, game_id: int, generation: int, board: Message
+    ) -> None:
+        while True:
+            await asyncio.sleep(5)
+            async with self._post_locks.setdefault(key, asyncio.Lock()):
+                state = await self.manager.snapshot(key)
+                if (
+                    state is None
+                    or state.game_id != game_id
+                    or state.generation != generation
+                ):
+                    return
+                if not await self._edit_frame(board, self._intercept_board_text(state)):
+                    return
 
     async def _send_public(
         self,
@@ -2566,9 +2821,7 @@ class ContestBot:
                 await self.bot.send_document(chat_id, screenshot_file_id)
             media_kind = None
 
-        async def send(
-            value: str, markup: InlineKeyboardMarkup | None
-        ) -> Message:
+        async def send(value: str, markup: InlineKeyboardMarkup | None) -> Message:
             if media_kind == "photo" and isinstance(screenshot_file_id, str):
                 return await self.bot.send_photo(
                     chat_id,
@@ -2584,9 +2837,7 @@ class ContestBot:
                     reply_markup=markup,
                 )
             if markup is not None:
-                return await self.bot.send_message(
-                    chat_id, value, reply_markup=markup
-                )
+                return await self.bot.send_message(chat_id, value, reply_markup=markup)
             return await self.bot.send_message(chat_id, value)
 
         try:
@@ -2695,20 +2946,19 @@ class ContestBot:
                 f"{snake} <b>Игра «Змейка» началась!</b>\n\n"
                 + common
                 + f"Нужно от <b>5 до 8</b> участников. Одно сообщение превращает "
-                f"участника в {apple}. После набора змея 30 секунд ищет добычу, "
-                "останавливается возле яблок и в конце выбирает победителя."
+                f"участника в {apple}. После набора змея ищет добычу, "
+                "собирает яблоки по маршруту. Последнее пойманное яблоко побеждает."
             )
         pickaxe = premium(PICKAXE_IDS[0], "⛏️")
         resources = " ".join(
-            premium(emoji_id, fallback)
-            for emoji_id, fallback, _ in PICKAXE_RESOURCES
+            premium(emoji_id, fallback) for emoji_id, fallback, _ in PICKAXE_RESOURCES
         )
         return (
             f"{pickaxe} <b>Игра «Кирка» началась!</b>\n\n"
             + common
             + f"Нужно ровно <b>5</b> участников — по одному на ресурс: {resources}. "
-            "После набора кирка автоматически добывает ресурсы 60 секунд. "
-            "Участник с самым большим количеством добычи победит."
+            "После набора кирка проходит 12 слоёв, каждый ресурс равновероятен. "
+            "Побеждает максимальная добыча; при равенстве — дополнительный удар среди лидеров."
         )
 
     def _parkour_attempt_text(
@@ -2738,6 +2988,19 @@ class ContestBot:
             )
         return f"{result}\n\n{'  '.join(route)}  🏁"
 
+    def _parkour_attempt_frames(
+        self, participant: Participant, attempt: ParkourAttemptUpdate
+    ) -> list[str]:
+        reached = 10 if attempt.collision_index is None else attempt.collision_index
+        frames = []
+        for step in sorted({0, reached // 2, reached}):
+            frames.append(
+                f"{premium(PARKOUR_IDS[0], '🏃‍♂️')} <b>Попытка {html.quote(participant.full_name[:24])}</b>\n\n"
+                f"{progress(step, 10, 10)}\nПройдено: <b>{step}/10</b>"
+            )
+        frames.append(self._parkour_attempt_text(participant, attempt))
+        return frames
+
     def _football_start_text(
         self,
         team_a: str,
@@ -2750,8 +3013,7 @@ class ContestBot:
         teams = football_teams or {}
         occupied = set((football_players or {}).values())
         counts = {
-            side: sum(value == side for value in teams.values())
-            for side in ("a", "b")
+            side: sum(value == side for value in teams.values()) for side in ("a", "b")
         }
 
         def lineup(start: int, end: int) -> str:
@@ -2777,9 +3039,7 @@ class ContestBot:
             else f"платное сообщение за {self._price_text(stars)}"
         )
         join_instruction = (
-            "сообщением"
-            if stars == 0
-            else "платным сообщением с указанной стоимостью"
+            "сообщением" if stars == 0 else "платным сообщением с указанной стоимостью"
         )
         return (
             f"{ball} <b>Матч: {html.quote(team_a)} vs {html.quote(team_b)}</b>\n"
@@ -2789,64 +3049,65 @@ class ContestBot:
             f"⭐️ <b>Вход в команду:</b> {entry_price}\n"
             "💰 <b>Выплаты игрокам победившей команды:</b> "
             "1-е — 2×, 2-е — 1,5×, 3-е — 1,3×, 4-е — 1,2×, 5-е — 1,1×.\n"
-            "🤝 <b>При ничьей:</b> выплат нет.\n"
+            "🥅 <b>При ничьей:</b> 5 пенальти каждой команде, затем до решающей пары.\n"
             f"⏰ <b>Набор открыт:</b> {format_duration(seconds)}\n\n"
             f"Чтобы войти, отправьте точное название <b>{html.quote(team_a)}</b> "
             f"или <b>{html.quote(team_b)}</b> {join_instruction}. Затем выберите "
             "свободного футболиста кнопкой. ✅ — занят, ❌ — свободен. "
-            "Команду и футболиста изменить нельзя."
+            "Команду и футболиста изменить нельзя. Если футболист не выбран, "
+            "бот назначит свободного. При заполнении 10 мест матч стартует сразу. "
+            "В каждой команде нужен хотя бы один участник. Выдача призов вручную."
         )
 
     async def _refresh_football_post(
         self, key: ContestKey, state: ContestState
     ) -> None:
-        if state.tracking_after_message_id is None:
-            return
-        remaining = max(
-            0,
-            math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
-        )
-        text = self._football_start_text(
-            state.team_a_name,
-            state.team_b_name,
-            state.message_stars,
-            remaining,
-            state.football_teams,
-            state.football_players,
-        )
-        markup = football_pick_keyboard(
-            state.team_a_name,
-            state.team_b_name,
-            set(state.football_players.values()),
-        )
-
-        async def edit(
-            value: str, keyboard: InlineKeyboardMarkup | None
-        ) -> None:
+        async with self._post_locks.setdefault(key, asyncio.Lock()):
+            # A queued refresh must never overwrite the current roster with an old copy.
+            latest = await self.manager.snapshot(key)
+            if (
+                latest is None
+                or latest.game_id != state.game_id
+                or latest.tracking_after_message_id is None
+            ):
+                return
+            remaining = max(
+                0, math.ceil((latest.deadline or 0) - asyncio.get_running_loop().time())
+            )
+            text = self._football_start_text(
+                latest.team_a_name,
+                latest.team_b_name,
+                latest.message_stars,
+                remaining,
+                latest.football_teams,
+                latest.football_players,
+            )
+            markup = football_pick_keyboard(
+                latest.team_a_name,
+                latest.team_b_name,
+                set(latest.football_players.values()),
+            )
             try:
                 await self.bot.edit_message_text(
                     chat_id=key[0],
-                    message_id=state.tracking_after_message_id,
-                    text=value,
-                    reply_markup=keyboard,
+                    message_id=latest.tracking_after_message_id,
+                    text=text,
+                    reply_markup=markup,
                 )
-            except TelegramBadRequest:
-                await self.bot.edit_message_caption(
-                    chat_id=key[0],
-                    message_id=state.tracking_after_message_id,
-                    caption=value,
-                    reply_markup=keyboard,
-                )
-
-        try:
-            await edit(text, markup)
-        except TelegramBadRequest:
-            try:
-                await edit(without_premium(text), without_premium_markup(markup))
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=key[0],
+                        message_id=latest.tracking_after_message_id,
+                        text=without_premium(text),
+                        reply_markup=without_premium_markup(markup),
+                    )
+                except TelegramAPIError:
+                    logger.debug("Could not refresh football post", exc_info=True)
             except TelegramAPIError:
                 logger.debug("Could not refresh football post", exc_info=True)
-        except TelegramAPIError:
-            logger.debug("Could not refresh football post", exc_info=True)
 
     def _case_start_text(self, saved_case: SavedCase) -> str:
         lines = [
@@ -2882,16 +3143,17 @@ class ContestBot:
             "Каждое обычное сообщение в чате участвует в постоянном розыгрыше."
         )
 
-    async def _finish_timed_game(
-        self, key: ContestKey, state: ContestState
-    ) -> None:
+    async def _finish_timed_game(self, key: ContestKey, state: ContestState) -> None:
+        async with self._game_phase(key, state):
+            await self._run_timed_game(key, state)
+
+    async def _run_timed_game(self, key: ContestKey, state: ContestState) -> None:
         if state.kind is ContestType.RACE:
             await self._finish_race(key, state)
         elif state.kind is ContestType.CASE:
             try:
                 await self._send_public(
-                    key[0],
-                    f"📦 <b>Кейс «{html.quote(state.case_name)}» закрыт.</b>"
+                    key[0], f"📦 <b>Кейс «{html.quote(state.case_name)}» закрыт.</b>"
                 )
             except TelegramAPIError:
                 logger.exception("Could not announce case expiration")
@@ -2907,152 +3169,92 @@ class ContestBot:
             await self._finish_football(key, state)
 
     async def _finish_race(self, key: ContestKey, state: ContestState) -> None:
-        participants = list(state.participants.values())
-        if not participants:
-            try:
-                await self._send_public(
-                    key[0], "🏎 <b>Гонка отменена:</b> участников нет."
-                )
-            except TelegramAPIError:
-                logger.exception("Could not announce empty race")
-            return
+        await self._finish_travel(key, state, flight=False)
 
-        winner = self._random.choice(participants)
-        frames = self._race_frames(participants, winner)
-        try:
-            race_message = await self._send_public(key[0], frames[0])
-            for frame in frames[1:]:
-                await asyncio.sleep(0.65)
-                try:
-                    await race_message.edit_text(frame)
-                except TelegramBadRequest:
-                    logger.debug("Race frame was not changed")
-            await asyncio.sleep(0.8)
-            await self._announce_winner(key, winner, state)
-        except TelegramAPIError:
-            logger.exception("Could not animate race")
+    async def _finish_airplane(self, key: ContestKey, state: ContestState) -> None:
+        await self._finish_travel(key, state, flight=True)
 
-    def _race_frames(
-        self, participants: list[Participant], winner: Participant
-    ) -> list[str]:
-        visible = participants[:30]
-        if winner not in visible:
-            visible[-1] = winner
-        positions = {participant.user_id: 0 for participant in visible}
-        frames: list[str] = []
-        for step in range(7):
-            if step:
-                for participant in visible:
-                    if participant.user_id == winner.user_id:
-                        positions[participant.user_id] = min(10, step * 2)
-                    else:
-                        positions[participant.user_id] = min(
-                            9,
-                            positions[participant.user_id] + self._random.randint(0, 2),
-                        )
-            lines = []
-            for participant in visible:
-                position = positions[participant.user_id]
-                track = "·" * position + "🏎" + "·" * (10 - position) + "🏁"
-                nickname = (
-                    f"@{participant.username}"
-                    if participant.username
-                    else participant.full_name
-                )
-                lines.append(f"{track} {html.quote(nickname)}")
-            if len(participants) > len(visible):
-                lines.append(f"…и ещё {len(participants) - len(visible)} участников")
-            title = "🏁 <b>Финиш!</b>" if step == 6 else "🏎 <b>Гонка идёт!</b>"
-            frames.append(f"{title}\n\n" + "\n".join(lines))
-        return frames
-
-    async def _finish_airplane(
-        self, key: ContestKey, state: ContestState
+    async def _finish_travel(
+        self, key: ContestKey, state: ContestState, *, flight: bool
     ) -> None:
         participants = list(state.participants.values())
         if not participants:
-            await self._safe_public(
-                key[0],
-                f"{premium(AIRPLANE_IDS[0], '✈️')} "
-                "<b>Полёт отменён:</b> участников нет.",
-            )
+            await self._safe_public(key[0], "🏁 <b>Старт отменён:</b> участников нет.")
             return
-        winner = self._random.choice(participants)
-        frames = self._airplane_frames(participants, winner)
-        try:
-            flight_message = await self._send_public(key[0], frames[0])
-            for frame in frames[1:]:
-                await asyncio.sleep(0.8)
-                try:
-                    await flight_message.edit_text(frame)
-                except TelegramBadRequest:
-                    logger.debug("Airplane frame was not changed")
-            await asyncio.sleep(0.8)
-            await self._announce_winner(key, winner, state)
-        except TelegramAPIError:
-            logger.exception("Could not animate airplane game")
+        result = simulations.travel(len(participants), self._random, flight=flight)
+        winner = participants[result.winner]
+        frames = self._travel_frames(participants, result, flight=flight)
+        await self._animate(key[0], frames)
+        await self._announce_winner(key, winner, state)
 
-    def _airplane_frames(
-        self, participants: list[Participant], winner: Participant
+    def _travel_frames(
+        self,
+        participants: list[Participant],
+        result: simulations.TravelResult,
+        *,
+        flight: bool = False,
     ) -> list[str]:
-        visible = participants[:30]
-        if winner not in visible:
-            visible[-1] = winner
-        positions = {participant.user_id: 0 for participant in visible}
-        frames: list[str] = []
-        for step in range(11):
-            birds: set[int] = set()
-            if step:
-                for participant in visible:
-                    hit = self._random.random() < 0.20
-                    if hit:
-                        birds.add(participant.user_id)
-                        positions[participant.user_id] = max(
-                            0, positions[participant.user_id] - 1
-                        )
-                    else:
-                        positions[participant.user_id] = min(
-                            11,
-                            positions[participant.user_id]
-                            + self._random.randint(1, 2),
-                        )
-                if step == 10:
-                    positions[winner.user_id] = 12
-                    birds.discard(winner.user_id)
-                    for participant in visible:
-                        if participant.user_id != winner.user_id:
-                            positions[participant.user_id] = min(
-                                11, positions[participant.user_id]
-                            )
+        frames = []
+        for step, snapshot in enumerate(result.frames):
+            final = step == len(result.frames) - 1
+            # The board follows the leaders, while every registered player is simulated.
+            ranking = sorted(
+                range(len(participants)), key=lambda i: -snapshot.positions[i]
+            )
+            visible = ranking[:8]
+            if final and result.winner not in visible:
+                visible[-1] = result.winner
             lines = []
-            for participant in visible:
-                position = positions[participant.user_id]
-                plane = premium(AIRPLANE_IDS[0], "✈️")
-                bird = (
-                    premium(AIRPLANE_IDS[1], "🕊")
-                    if participant.user_id in birds
-                    else ""
+            for index in visible:
+                participant = participants[index]
+                name = html.quote(
+                    (
+                        f"@{participant.username}"
+                        if participant.username
+                        else participant.full_name
+                    )[:22]
                 )
-                track = "·" * position + bird + plane + "·" * (12 - position) + "🏁"
-                nickname = (
-                    f"@{participant.username}"
-                    if participant.username
-                    else participant.full_name
+                position = snapshot.positions[index]
+                marker = premium(AIRPLANE_IDS[0], "✈️") if flight else "🏎"
+                hazard = (
+                    premium(AIRPLANE_IDS[1], "🕊") if index in snapshot.hazards else ""
                 )
-                lines.append(f"{track} {html.quote(nickname)}")
-            title = (
-                "🏁 <b>Первый самолёт на финише!</b>"
-                if step == 10
-                else f"{premium(AIRPLANE_IDS[0], '✈️')} <b>Полёт продолжается!</b>"
-            )
-            note = (
-                f"\n{premium(AIRPLANE_IDS[1], '🕊')} "
-                "Птица замедляет самолёт и опускает его назад."
-                if birds
-                else ""
-            )
-            frames.append(f"{title}{note}\n\n" + "\n".join(lines))
+                lines.append(
+                    f"{marker} <b>{name}</b> {hazard}\n{progress(position, result.distance)} {position}/{result.distance}"
+                )
+            if len(participants) > len(visible):
+                lines.append(
+                    f"Ещё {len(participants) - len(visible)} участников участвуют в расчёте."
+                )
+            if final:
+                title = (
+                    "🏁 <b>Первый самолёт на финише!</b>"
+                    if flight and result.reached_finish
+                    else "🏁 <b>Финиш!</b>"
+                )
+                if not result.reached_finish:
+                    title = "🏁 <b>Полёт завершён — итог по дальности.</b>"
+                lines.append(
+                    f"{icon('trophy')} <b>Победитель:</b> {participant_link(participants[result.winner])}"
+                )
+            else:
+                title = (
+                    (premium(AIRPLANE_IDS[0], "✈️") + " <b>Полёт</b>")
+                    if flight
+                    else "🏎 <b>Гонка</b>"
+                )
+                title += f" · этап {step + 1}"
+            frames.append(title + "\n\n" + "\n\n".join(lines))
         return frames
+
+    def _race_frames(self, participants: list[Participant]) -> list[str]:
+        return self._travel_frames(
+            participants, simulations.travel(len(participants), self._random)
+        )
+
+    def _airplane_frames(self, participants: list[Participant]) -> list[str]:
+        result = simulations.travel(len(participants), self._random, flight=True)
+        return self._travel_frames(participants, result, flight=True)
 
     async def _finish_parkour(self, key: ContestKey, state: ContestState) -> None:
         await self._safe_public(
@@ -3063,89 +3265,61 @@ class ContestBot:
         )
 
     async def _finish_snake(self, key: ContestKey, state: ContestState) -> None:
-        participants = list(state.participants.values())
+        participants = list(state.participants.values())[:8]
         if len(participants) < 5:
             await self._safe_public(
                 key[0],
-                f"{premium(SNAKE_IDS[0], '🐍')} <b>Змейка отменена:</b> "
-                f"нужно минимум 5 участников, набралось {len(participants)}.",
+                f"🐍 <b>Змейка отменена:</b> нужно минимум 5 участников, набралось {len(participants)}.",
             )
             return
-        participants = participants[:8]
-        winner = self._random.choice(participants)
-        frames = self._snake_frames(participants, winner)
-        snake_message: Message | None = None
-        try:
-            for step, frame in enumerate(frames):
-                if step:
-                    await asyncio.sleep(2)
-                if snake_message is None:
-                    snake_message = await self._send_public(key[0], frame)
-                else:
-                    try:
-                        await snake_message.edit_text(frame)
-                    except TelegramBadRequest:
-                        try:
-                            await snake_message.edit_text(without_premium(frame))
-                        except TelegramBadRequest:
-                            logger.debug("Snake frame was not changed")
-            await self._announce_winner(key, winner, state)
-        except TelegramAPIError:
-            logger.exception("Could not animate snake game")
+        snapshots, winner_index = simulations.snake(len(participants), self._random)
+        frames = self._snake_frames(participants, snapshots, winner_index)
+        await self._animate(key[0], frames)
+        await self._announce_winner(key, participants[winner_index], state)
 
     @staticmethod
     def _snake_frames(
-        participants: list[Participant], winner: Participant
+        participants: list[Participant],
+        snapshots: tuple[simulations.SnakeFrame, ...],
+        winner_index: int,
     ) -> list[str]:
-        size = 7
-        path = [
-            (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
-            (2, 5), (3, 5), (4, 5), (5, 5), (5, 4),
-            (5, 3), (5, 2), (5, 1), (4, 1), (3, 1), (2, 1),
-        ]
-        apple_steps = (4, 8, 12, 15)
-        apple_targets = [
-            participants[index % len(participants)]
-            for index in range(len(apple_steps) - 1)
-        ] + [winner]
-        frames: list[str] = []
-        snake_icon = premium(SNAKE_IDS[0], "🐍")
-        apple_icon = premium(SNAKE_IDS[1], "🍎")
-
-        for step, head in enumerate(path):
-            eaten = sum(milestone <= step for milestone in apple_steps)
-            length = 2 + eaten
-            body = set(path[max(0, step - length + 1) : step])
-            target_index = next(
-                (index for index, milestone in enumerate(apple_steps) if milestone > step),
-                len(apple_steps) - 1,
-            )
-            finished = step == len(path) - 1
-            apple_position = None if finished else path[apple_steps[target_index]]
-            target = winner if finished else apple_targets[target_index]
-
-            rows: list[str] = []
-            for row in range(size):
-                cells: list[str] = []
-                for column in range(size):
+        frames = []
+        # Keep the route readable without flooding Telegram with every single step.
+        indices = sorted(
+            {
+                round(i * (len(snapshots) - 1) / min(15, len(snapshots) - 1))
+                for i in range(min(15, len(snapshots) - 1) + 1)
+            }
+        )
+        for step in indices:
+            snapshot = snapshots[step]
+            final = step == len(snapshots) - 1
+            apple_positions = {position: index for index, position in snapshot.apples}
+            rows = []
+            for row in range(7):
+                cells = []
+                for column in range(7):
                     cell = (row, column)
-                    if cell == head:
-                        cells.append(snake_icon)
-                    elif cell in body:
+                    if cell == snapshot.head:
+                        cells.append(premium(SNAKE_IDS[0], "🐍"))
+                    elif cell in apple_positions:
+                        cells.append(premium(SNAKE_IDS[1], "🍎"))
+                    elif cell in snapshot.body:
                         cells.append("🟩")
-                    elif cell == apple_position:
-                        cells.append(apple_icon)
                     else:
                         cells.append("⬛")
                 rows.append("".join(cells))
-
-            if finished:
-                title = f"{snake_icon} <b>Яблоко поймано!</b>"
-                target_line = f"🏆 <b>Победитель:</b> {participant_link(winner)}"
-            else:
-                title = f"{snake_icon} <b>Змейка движется по полю…</b>"
-                target_line = f"{apple_icon} <b>Цель:</b> {participant_link(target)}"
-            frames.append(f"{title}\n\n" + "\n".join(rows) + f"\n\n{target_line}")
+            title = (
+                "🐍 <b>Маршрут завершён!</b>"
+                if final
+                else "🐍 <b>Змейка ищет яблоки…</b>"
+            )
+            remaining = [participants[index] for index, _ in snapshot.apples]
+            legend = " · ".join(html.quote(p.full_name[:16]) for p in remaining)
+            note = f"Осталось яблок: <b>{len(remaining)}</b> · {legend}"
+            if final:
+                note = f"{icon('trophy')} <b>Последнее яблоко — победитель:</b> {participant_link(participants[winner_index])}"
+            frames.append(title + "\n\n" + "\n".join(rows) + "\n\n" + note)
         return frames
 
     async def _finish_pickaxe(self, key: ContestKey, state: ContestState) -> None:
@@ -3153,52 +3327,33 @@ class ContestBot:
         if len(participants) < 5:
             await self._safe_public(
                 key[0],
-                f"{premium(PICKAXE_IDS[0], '⛏️')} <b>Кирка отменена:</b> "
-                f"нужно 5 участников, набралось {len(participants)}.",
+                f"⛏️ <b>Кирка отменена:</b> нужно 5 участников, набралось {len(participants)}.",
             )
             return
-        counts = {participant.user_id: 0 for participant in participants}
-        mining_message: Message | None = None
-        winner: Participant | None = None
-        try:
-            for step in range(13):
-                mined_for: Participant | None = None
-                if step:
-                    await asyncio.sleep(5)
-                    mined_for = self._random.choice(participants)
-                    counts[mined_for.user_id] += 1
-                finished = step == 12
-                if finished:
-                    top = max(counts.values())
-                    leaders = [
-                        participant
-                        for participant in participants
-                        if counts[participant.user_id] == top
-                    ]
-                    winner = self._random.choice(leaders)
-                    if len(leaders) > 1:
-                        counts[winner.user_id] += 1
-                frame = self._pickaxe_frame(
-                    participants,
-                    counts,
-                    finished,
-                    depth=step,
-                    mined_user_id=(mined_for.user_id if mined_for else None),
+        snapshots, winner_index = simulations.mine(len(participants), self._random)
+        frames = []
+        for step, snapshot in enumerate(snapshots):
+            counts = {
+                participant.user_id: snapshot.counts[index]
+                for index, participant in enumerate(participants)
+            }
+            frame = self._pickaxe_frame(
+                participants,
+                counts,
+                step == len(snapshots) - 1,
+                depth=min(step, 12),
+                mined_user_id=participants[snapshot.miner].user_id
+                if snapshot.miner is not None
+                else None,
+            )
+            if snapshot.tiebreak:
+                frame = (
+                    "⚡ <b>Равная добыча — дополнительный решающий удар!</b>\n\n"
+                    + frame
                 )
-                if mining_message is None:
-                    mining_message = await self._send_public(key[0], frame)
-                else:
-                    try:
-                        await mining_message.edit_text(frame)
-                    except TelegramBadRequest:
-                        try:
-                            await mining_message.edit_text(without_premium(frame))
-                        except TelegramBadRequest:
-                            logger.debug("Pickaxe frame was not changed")
-            assert winner is not None
-            await self._announce_winner(key, winner, state)
-        except TelegramAPIError:
-            logger.exception("Could not animate pickaxe game")
+            frames.append(frame)
+        await self._animate(key[0], frames, delay=1.5)
+        await self._announce_winner(key, participants[winner_index], state)
 
     @staticmethod
     def _pickaxe_frame(
@@ -3241,7 +3396,7 @@ class ContestBot:
             if participant.user_id == mined_user_id:
                 mined_icon = premium(emoji_id, fallback)
         title = (
-            f"{pickaxe} <b>Минута закончилась — шахта выкопана!</b>"
+            f"{pickaxe} <b>Все слои пройдены — шахта выкопана!</b>"
             if finished
             else f"{pickaxe} <b>Кирка копает вниз…</b>"
         )
@@ -3263,100 +3418,63 @@ class ContestBot:
                 )
         except TelegramAPIError:
             logger.debug("Could not remove football player keyboard")
-
-        score = [0, 0]
-        pass_bonus = [0.0, 0.0]
-        attacks = [0, 0]
-        player_stats = {index: 0 for index in range(len(FOOTBALLERS))}
-        match_message: Message | None = None
-        try:
-            for turn in range(20):
-                side = turn % 2
-                attacks[side] += 1
-                player_index = self._random.choice(
-                    range(side * 5, side * 5 + 5)
-                )
-                action = self._random.choice(("strong", "accurate", "pass"))
-                defense = self._random.choice(("keeper", "wall", "intercept"))
-                commentary, goal = self._resolve_football_attack(
-                    action, defense, pass_bonus, side
-                )
-                if goal:
-                    score[side] += 1
-                    player_stats[player_index] += 3
-                elif action == "pass" and commentary.startswith("Точный пас"):
-                    player_stats[player_index] += 2
-                else:
-                    player_stats[player_index] += 1
-                frame = self._football_scoreboard(
-                    state,
-                    score,
-                    attacks,
-                    side,
-                    player_index,
-                    action,
-                    defense,
-                    commentary,
-                    goal,
-                )
-                if match_message is None:
-                    match_message = await self._send_public(key[0], frame)
-                else:
-                    await asyncio.sleep(0.7)
-                    try:
-                        await match_message.edit_text(frame)
-                    except TelegramBadRequest:
-                        logger.debug("Football frame was not changed")
-            await asyncio.sleep(0.7)
-            winning_side = 0 if score[0] > score[1] else 1
-            ranking = sorted(
-                range(winning_side * 5, winning_side * 5 + 5),
-                key=lambda index: (-player_stats[index], index),
+        counts = {
+            side: sum(value == side for value in state.football_teams.values())
+            for side in ("a", "b")
+        }
+        if not counts["a"] or not counts["b"]:
+            await self._safe_public(
+                key[0],
+                self._football_refund_text(
+                    state, "Матч отменён: в каждой команде нужен хотя бы один участник."
+                ),
             )
-            await self._announce_football_result(key, state, score, ranking)
-        except TelegramAPIError:
-            logger.exception("Could not animate football match")
-
-    def _resolve_football_attack(
-        self,
-        action: str,
-        defense: str,
-        pass_bonus: list[float],
-        side: int,
-    ) -> tuple[str, bool]:
-        if action == "pass":
-            if defense == "intercept" and self._random.random() < 0.55:
-                pass_bonus[side] = 0.0
-                return "Перехват! Защита читает передачу и забирает мяч.", False
-            pass_bonus[side] = min(0.36, pass_bonus[side] + 0.12)
-            return "Точный пас! Сила следующей атаки повышена.", False
-
-        probability = 0.46 if action == "strong" else 0.34
-        probability += pass_bonus[side]
-        pass_bonus[side] = 0.0
-        if defense == "keeper":
-            probability -= 0.14
-        elif defense == "wall" and action == "strong":
-            probability -= 0.28
-        elif defense == "intercept":
-            probability -= 0.08
-        probability = max(0.06, min(0.82, probability))
-        if self._random.random() < probability:
-            description = (
-                "Мощнейший удар — мяч в сетке!"
-                if action == "strong"
-                else "Ювелирный удар в угол — ГОЛ!"
+            return
+        # A paid participant who missed the player button still gets a free slot.
+        for user_id, side in state.football_teams.items():
+            if user_id not in state.football_players:
+                available = [
+                    i
+                    for i in range(0 if side == "a" else 5, 5 if side == "a" else 10)
+                    if i not in state.football_players.values()
+                ]
+                state.football_players[user_id] = self._random.choice(available)
+        result = simulations.football(self._random)
+        frames = [
+            self._football_scoreboard(
+                state,
+                list(event.score),
+                list(event.attacks),
+                event.side,
+                event.player,
+                event.action,
+                event.defense,
+                event.commentary,
+                event.goal,
             )
-            return description, True
-        miss = self._random.choice(
-            (
-                "Вратарь отбивает мяч!",
-                "Удар в штангу — защита выносит!",
-                "Мяч уходит в аут.",
-                "Защитник блокирует удар.",
-            )
+            for event in result.events
+        ]
+        if result.penalties:
+            # One frame per complete pair, so neither team gets a visual extra kick.
+            for index in range(1, len(result.penalties), 2):
+                first, second = result.penalties[index - 1 : index + 1]
+                frames.append(
+                    f"⚽ <b>Пенальти · раунд {second.round}</b>\n\n"
+                    f"🔵 {html.quote(state.team_a_name)}: {'ГОЛ ✅' if first.goal else 'СЕЙВ 🧤'}\n"
+                    f"🔴 {html.quote(state.team_b_name)}: {'ГОЛ ✅' if second.goal else 'СЕЙВ 🧤'}\n\n"
+                    f"<b>По пенальти: {second.score[0]} : {second.score[1]}</b>\n"
+                    f"Основное время: {result.score[0]} : {result.score[1]}"
+                )
+        await self._animate(key[0], frames)
+        await self._announce_football_result(
+            key,
+            state,
+            list(result.score),
+            list(result.ranking),
+            winning_side=result.winner,
+            penalty_score=result.penalties[-1].score if result.penalties else None,
+            player_points=result.points,
         )
-        return miss, False
 
     @staticmethod
     def _football_scoreboard(
@@ -3383,16 +3501,11 @@ class ContestBot:
         attacker = state.team_a_name if side == 0 else state.team_b_name
         player_name, player_emoji_id, player_fallback = FOOTBALLERS[player_index]
         player = (
-            f"{premium(player_emoji_id, player_fallback)} "
-            f"{html.quote(player_name)}"
+            f"{premium(player_emoji_id, player_fallback)} {html.quote(player_name)}"
         )
         ball = premium(FOOTBALL_BALL_ID, "⚽")
         minute = min(90, round((sum(attacks) / 20) * 90))
-        goal_art = (
-            "\n<pre>     ________\n    |   ГОЛ  |\n    |___⚽___|</pre>"
-            if goal
-            else ""
-        )
+        goal_art = "\n\n🥅 ➜ ⚽ " + icon("bang") + " <b>ГОООЛ!</b>" if goal else ""
         return (
             f"{ball} <b>{minute}' — атакует {html.quote(attacker)}</b>\n"
             f"Футболист: {player}\n\n"
@@ -3401,7 +3514,7 @@ class ContestBot:
             f"⚡️ <i>{commentary}</i>{goal_art}\n\n"
             f"🔵 {html.quote(state.team_a_name)} <b>{score[0]} - {score[1]}</b> "
             f"{html.quote(state.team_b_name)} 🔴\n"
-            f"Атаки: {attacks[0]}/10 — {attacks[1]}/10"
+            f"Атаки: {attacks[0]}/10 — {attacks[1]}/10\n{progress(sum(attacks), 20)}"
         )
 
     async def _announce_football_result(
@@ -3410,30 +3523,36 @@ class ContestBot:
         state: ContestState,
         score: list[int],
         player_ranking: list[int] | None = None,
+        *,
+        winning_side: int | None = None,
+        penalty_score: tuple[int, int] | None = None,
+        player_points: tuple[int, ...] | None = None,
     ) -> None:
         ball = premium(FOOTBALL_BALL_ID, "⚽")
-        if score[0] == score[1]:
+        if winning_side is None and score[0] != score[1]:
+            winning_side = 0 if score[0] > score[1] else 1
+        if winning_side is None:
             text = (
                 "🤝 <b>Матч завершён вничью!</b>\n\n"
                 f"{ball} {html.quote(state.team_a_name)} "
                 f"<b>{score[0]} - {score[1]}</b> "
                 f"{html.quote(state.team_b_name)}\n\n"
-                "Победителей нет. Все суммы за вход сгорают."
+                + self._football_refund_text(state, "Победителей нет.")
             )
             await self._safe_public(key[0], text)
             return
 
-        winning_choice = "a" if score[0] > score[1] else "b"
+        winning_choice = "a" if winning_side == 0 else "b"
         winning_side = 0 if winning_choice == "a" else 1
-        winning_name = (
-            state.team_a_name if winning_choice == "a" else state.team_b_name
-        )
+        winning_name = state.team_a_name if winning_choice == "a" else state.team_b_name
         expected_players = list(range(winning_side * 5, winning_side * 5 + 5))
-        ranking = [
-            index
-            for index in (player_ranking or expected_players)
-            if index in expected_players
-        ]
+        ranking = list(
+            dict.fromkeys(
+                index
+                for index in (player_ranking or expected_players)
+                if index in expected_players
+            )
+        )
         ranking.extend(index for index in expected_players if index not in ranking)
         ranking = ranking[:5]
         participant_by_player = {
@@ -3444,12 +3563,8 @@ class ContestBot:
         }
 
         def amount(multiplier: float) -> str:
-            value = state.message_stars * multiplier
-            return (
-                str(int(value))
-                if value.is_integer()
-                else str(value).replace(".", ",")
-            )
+            value = Decimal(state.message_stars) * Decimal(str(multiplier))
+            return str(value.quantize(Decimal(1), rounding=ROUND_DOWN))
 
         def multiplier_text(multiplier: float) -> str:
             return (
@@ -3470,16 +3585,17 @@ class ContestBot:
             else:
                 paid_winners += 1
                 receiver = (
-                    f"{participant_link(participant)} получает "
+                    f"{participant_link(participant)} — к выдаче "
                     f"<b>{amount(multiplier)} Stars</b>"
                 )
             lines.append(
                 f"{place}. {premium(emoji_id, fallback)} <b>{html.quote(name)}</b> "
                 f"— <b>{multiplier_text(multiplier)}×</b> — {receiver}"
+                + (f" · рейтинг {player_points[player_index]}" if player_points else "")
             )
         ranking_text = "\n".join(lines)
         winners_note = (
-            f"Выплаты получают <b>{paid_winners}</b> участников."
+            f"К выдаче призы для <b>{paid_winners}</b> участников."
             if paid_winners
             else "<i>В победившей команде никто не зафиксировал футболиста.</i>"
         )
@@ -3488,11 +3604,32 @@ class ContestBot:
             f"{ball} {html.quote(state.team_a_name)} "
             f"<b>{score[0]} - {score[1]}</b> "
             f"{html.quote(state.team_b_name)}\n"
-            f"💰 {winners_note}\n\n"
+            + (
+                f"По пенальти: <b>{penalty_score[0]} : {penalty_score[1]}</b>\n"
+                if penalty_score
+                else ""
+            )
+            + f"💰 {winners_note}\n\n"
             f"<b>Рейтинг футболистов победившей команды:</b>\n{ranking_text}\n\n"
+            "<i>Рейтинг: гол +3, голевой пас +2, защита +1. "
+            "При равенстве рейтинга — жеребьёвка. Stars округляются вниз. "
+            "Выдача организатором вручную.</i>\n\n"
             f"<b>{html.quote(self.settings.prize_call)}</b>"
         )
         await self._safe_public(key[0], text)
+
+    @staticmethod
+    def _football_refund_text(state: ContestState, reason: str) -> str:
+        lines = [
+            f"{participant_link(state.participants[uid])} — <b>{state.football_paid_stars.get(uid, state.message_stars)} Stars</b>"
+            for uid in state.football_teams
+            if uid in state.participants
+        ]
+        return (
+            f"⚽ <b>{html.quote(reason)}</b>\n\n"
+            "Входы подлежат ручному возврату организатором. Автовозврат не выполняется.\n"
+            + "\n".join(lines)
+        )
 
     async def _safe_public(self, chat_id: int, text: str) -> None:
         try:
@@ -3500,9 +3637,7 @@ class ContestBot:
         except TelegramAPIError:
             logger.exception("Could not publish contest result")
 
-    def _winner_text(
-        self, winner: Participant, state: ContestState
-    ) -> str:
+    def _winner_text(self, winner: Participant, state: ContestState) -> str:
         if state.kind is ContestType.CASINO:
             title = "Казино завершено!"
         elif state.kind is ContestType.INTERCEPT:
@@ -3533,7 +3668,15 @@ class ContestBot:
     async def _announce_timed_winner(
         self, key: ContestKey, winner: Participant, state: ContestState
     ) -> None:
-        await self._announce_winner(key, winner, state)
+        async with self._game_phase(key, state):
+            board = self._intercept_boards.pop(key, None)
+            if board:
+                board[1].cancel()
+                await self._edit_frame(
+                    board[0],
+                    f"{icon('trophy')} <b>Время вышло!</b>\n{participant_link(winner)} удержал лидерство.",
+                )
+            await self._announce_winner(key, winner, state)
 
     async def _announce_winner(
         self, key: ContestKey, winner: Participant, state: ContestState
@@ -3552,9 +3695,7 @@ class ContestBot:
                 return "⚡ «Перебив» активен. Ждём первое сообщение участника."
             remaining = max(
                 0,
-                math.ceil(
-                    (state.deadline or 0) - asyncio.get_running_loop().time()
-                ),
+                math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
             )
             return (
                 f"⚡ <b>«Перебив»</b>\n"
@@ -3563,15 +3704,30 @@ class ContestBot:
                 f"Приз: <i>{format_prize(state.prize)}</i>"
             )
         if state.kind is ContestType.CASINO:
+            leaders = sorted(
+                state.jackpot_hits, key=lambda uid: -state.jackpot_hits[uid]
+            )[:5]
+            ranking = "\n".join(
+                f"{position}. {participant_link(state.participants[uid])} — {state.jackpot_hits[uid]}/{state.jackpot_target}"
+                for position, uid in enumerate(leaders, 1)
+                if uid in state.participants
+            )
             return (
                 "🎰 <b>Казино 777 активно.</b>\n"
                 f"Для победы нужно выбить 777: <b>{state.jackpot_target} раз.</b>\n"
-                f"Приз: <i>{format_prize(state.prize)}</i>"
+                f"Приз: <i>{format_prize(state.prize)}</i>\n"
+                f"Попыток: <b>{sum(state.attempts.values())}</b>\n\n"
+                + (
+                    f"<b>Лидеры:</b>\n{ranking}"
+                    if ranking
+                    else "Первый джекпот ещё впереди."
+                )
             )
         if state.kind is ContestType.GUESS:
             return (
                 "🔢 <b>«Угадай число» активна.</b>\n"
                 f"Одна попытка: <b>{self._price_text(state.message_stars)}</b>\n"
+                f"Проверено чисел: <b>{sum(state.attempts.values())}</b>\n"
                 f"Приз: <i>{format_prize(state.prize)}</i>"
             )
         if state.kind is ContestType.RACE:
@@ -3606,11 +3762,7 @@ class ContestBot:
                 math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
             )
             title = ARCADE_TITLES[state.kind]
-            mode = (
-                "попыток"
-                if state.kind is ContestType.PARKOUR
-                else "участников"
-            )
+            mode = "попыток" if state.kind is ContestType.PARKOUR else "участников"
             return (
                 f"<b>«{title}» активна.</b>\n"
                 f"Принято {mode}: <b>{len(state.participants)}</b>\n"
@@ -3622,12 +3774,8 @@ class ContestBot:
                 0,
                 math.ceil((state.deadline or 0) - asyncio.get_running_loop().time()),
             )
-            team_a_count = sum(
-                team == "a" for team in state.football_teams.values()
-            )
-            team_b_count = sum(
-                team == "b" for team in state.football_teams.values()
-            )
+            team_a_count = sum(team == "a" for team in state.football_teams.values())
+            team_b_count = sum(team == "b" for team in state.football_teams.values())
             return (
                 f"{premium(FOOTBALL_BALL_ID, '⚽')} "
                 f"<b>{html.quote(state.team_a_name)} vs "
@@ -3651,6 +3799,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     contest_bot = ContestBot(bot, settings, storage)
+    await contest_bot.load_emoji_alts()
     dispatcher = Dispatcher()
     dispatcher.include_router(contest_bot.router)
 
@@ -3669,7 +3818,7 @@ async def main() -> None:
             bot, allowed_updates=dispatcher.resolve_used_update_types()
         )
     finally:
-        await contest_bot.manager.close()
+        await contest_bot.close()
 
 
 def run() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +33,9 @@ def _parse_owner_ids(raw: str) -> frozenset[int]:
     try:
         return frozenset(int(item.strip()) for item in raw.split(",") if item.strip())
     except ValueError as exc:
-        raise RuntimeError("OWNER_IDS должен содержать Telegram ID через запятую") from exc
+        raise RuntimeError(
+            "OWNER_IDS должен содержать Telegram ID через запятую"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +47,11 @@ class Settings:
     intercept_seconds: int = 120
     casino_cooldown_seconds: float = 3.0
     prize_call: str = "@Monster_Tags, выдай приз победителю!"
+    animation_step_seconds: float = 1.2
+    animations_enabled: bool = True
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         _load_env_file()
         token = os.getenv("BOT_TOKEN", "").strip()
         if not token:
@@ -62,6 +67,10 @@ class Settings:
         if not 0 <= casino_cooldown <= 60:
             raise RuntimeError("CASINO_COOLDOWN_SECONDS должен быть от 0 до 60")
 
+        animation_step = float(os.getenv("ANIMATION_STEP_SECONDS", "1.2"))
+        if not math.isfinite(animation_step) or not 0.4 <= animation_step <= 5:
+            raise RuntimeError("ANIMATION_STEP_SECONDS должен быть от 0.4 до 5")
+
         return cls(
             bot_token=token,
             owner_ids=_parse_owner_ids(os.getenv("OWNER_IDS", "")),
@@ -71,6 +80,9 @@ class Settings:
             or "monster_bot.sqlite3",
             intercept_seconds=intercept_seconds,
             casino_cooldown_seconds=casino_cooldown,
+            animation_step_seconds=animation_step,
+            animations_enabled=os.getenv("ANIMATIONS_ENABLED", "true").strip().lower()
+            not in {"0", "false", "no"},
             prize_call=os.getenv(
                 "PRIZE_CALL", "@Monster_Tags, выдай приз победителю!"
             ).strip()
